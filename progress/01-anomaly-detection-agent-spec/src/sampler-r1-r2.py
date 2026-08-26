@@ -6,11 +6,11 @@ plus ``{group}_metadata.parquet`` in the unified format.
 
 Every tunable knob lives in the CONFIGURATION block below.
 
-Two logic versions are provided, selected by ``SAMPLER_LOGIC`` (see the CONFIGURATION
-block): ``"v2"``, the default, and ``"v1"``, the legacy behaviour kept for comparison.
+The previous behaviour is kept intact behind ``LEGACY_SAMPLER = True`` for byte-exact
+comparison runs; everything below describes the current logic.
 
-Guarantees (both versions)
---------------------------
+Guarantees (both modes)
+-----------------------
 Disjoint coverage
     Chunks of one series never overlap; a point belongs to at most one sample.
 
@@ -20,15 +20,15 @@ Unique keys
 Length budget
     Every sample satisfies ``ABSOLUTE_MIN <= length <= ABSOLUTE_MAX``.
 
-Additional guarantee of v2 (leak-free sampling)
------------------------------------------------
+Leak-free sampling
+------------------
 No sample boundary ever depends on the labels: the chunk size is computed once per
 series from the values alone (period-aware, so real series keep their different natural
 sizes), chunks are laid on a fixed grid, and the anomaly budget
-(``V2_MAX_ANOMALY_RATIO``) is enforced purely by rejecting over-budget slots. Sample
-length therefore cannot act as a proxy for ``y_i``. Under v1, whose dilution and
-cluster expansion stretched exactly the dirty samples, a length-only classifier reached
-0.97 AUROC on R2; that is the leak v2 exists to close.
+(``MAX_ANOMALY_RATIO``) is enforced purely by rejecting over-budget slots. Sample
+length therefore cannot act as a proxy for ``y_i``. Under the legacy logic, whose
+dilution and cluster expansion stretched exactly the dirty samples, a length-only
+classifier reached 0.97 AUROC on R2; that is the leak this design closes.
 """
 
 from __future__ import annotations
@@ -72,65 +72,57 @@ BASE_CHUNK_SIZE = 1500      # starting chunk size, grown to whole periods when o
                             # detected. This is the knob that shapes the pool: it sets
                             # how much context a sample carries and, with it, the natural
                             # positive rate (a longer window is likelier to contain an
-                            # anomaly). Measured under the v2 pipeline, the natural rate
+                            # anomaly). Measured on this pipeline, the natural rate
                             # at base 1000/1500/2000 runs 27/35/40% on R1 and 18/24/29%
                             # on R2 - so 1500 keeps R2 essentially on the 25% target
                             # while R1's surplus positives (which it has in abundance)
                             # are trimmed by composition; 1000 would halve the context
                             # of aperiodic series only to starve R2 of positives.
 ABSOLUTE_MIN = 1000         # hard lower bound on an emitted sample
-ABSOLUTE_MAX = 35000        # hard upper bound on an emitted sample; under v2 this is the
-                            # only upper bound - a chunk grows only to span whole periods
+ABSOLUTE_MAX = 35000        # hard upper bound on an emitted sample and the only upper
+                            # bound - a chunk grows only to span whole periods
 
-# --- Sampling logic version ---
-# "v2" (default): leak-free. Chunk boundaries are computed from the values only (period)
-#   and laid on a fixed grid; the anomaly budget is enforced purely by rejection. Nothing
-#   about a sample's span ever depends on the labels, so sample length cannot act as a
-#   proxy for y_i (in v1 a length-only classifier scored 0.97 AUROC on R2).
-# "v1" (legacy): dilution toward TARGET_ANOMALY_RATIO, anomaly-cluster expansion,
-#   whole-series triage and clean salvage. Kept intact for comparison; to return to it,
-#   set SAMPLER_LOGIC = "v1" - nothing else needs to change.
-SAMPLER_LOGIC = "v2"
+# --- Legacy mode ---
+# False (default): leak-free logic as described in the module docstring.
+# True: the previous behaviour - dilution toward LEGACY_TARGET_ANOMALY_RATIO,
+#   anomaly-cluster expansion, whole-series triage and clean salvage. Kept byte-exact
+#   for comparison runs; nothing else needs to change to switch.
+LEGACY_SAMPLER = False
 
 # --- Anomaly budget (share of anomalous points inside one sample) ---
-# v2 uses the single rejection cap. Above it, "series contains an anomaly" stops being an
-# honest description and majority-based detectors start inverting.
-V2_MAX_ANOMALY_RATIO = 0.30
+# A single rejection cap. Above it, "series contains an anomaly" stops being an honest
+# description and majority-based detectors start inverting.
+MAX_ANOMALY_RATIO = 0.30
 
-# v1-only knobs (ignored under v2):
-TARGET_CHUNK_MAX = 8000            # soft chunk cap. Dropped from v2, where it could
-                                   # never bind: the cap was defined as
-                                   # max(TARGET_CHUNK_MAX, period * MIN_PERIODS_PER_CHUNK),
-                                   # so it raised itself to whatever the period demanded.
-                                   # It was also unreachable in practice: the longest
-                                   # period the legacy detector found in R1/R2 was
-                                   # 2,524, i.e. 7,572 points for three periods, still
-                                   # under 8,000.
-TARGET_ANOMALY_RATIO = 0.06        # dilution aims here first
-ACCEPTABLE_ANOMALY_RATIO = 0.15    # fallback bound; every emitted sample satisfies it
-MAX_ANOMALY_RATIO = 0.27           # above this a whole series is treated as degenerate
+# Legacy-only knobs (ignored otherwise):
+LEGACY_TARGET_CHUNK_MAX = 8000            # soft chunk cap; the current grid drops it -
+                                          # defined as max(cap, period * MIN_PERIODS_PER_CHUNK),
+                                          # it raised itself to whatever the period demanded
+LEGACY_TARGET_ANOMALY_RATIO = 0.06        # dilution aims here first
+LEGACY_ACCEPTABLE_ANOMALY_RATIO = 0.15    # fallback bound; every emitted sample satisfies it
+LEGACY_MAX_ANOMALY_RATIO = 0.27           # above this a whole series is treated as degenerate
 
 # --- Anomaly cluster handling ---
 ANOMALY_LOOKAHEAD = 100     # gap tolerated when joining anomalies into one cluster
 
-# --- Representativeness screen (v2; clean samples only) ---
+# --- Representativeness screen (clean samples only) ---
 # A clean-labelled chunk wildly unlike its parent series is suspicious of unlabelled
 # anomalies (known TSB-UAD label noise) and is dropped. The deviation is measured
 # against a ROBUST reference - the parent's mean/std after winsorizing at
-# V2_REFERENCE_CLIP_SIGMAS robust sigmas - so a recording's own anomalies cannot widen
+# REFERENCE_CLIP_SIGMAS robust sigmas - so a recording's own anomalies cannot widen
 # its tolerance band. The threshold sits where measured innocence ends: on R1, clean
 # chunks deviating 1.0-1.5 still look like the bulk (max excursion ~3 sigma, vs 2.1 for
 # the crowd), while those beyond 1.5 carry unlabelled excursions of 9-44 sigma. Cost:
 # 4.2% of R1's clean slots, 0.7% of R2's; the screen errs toward label purity.
-V2_STATS_TOLERANCE = 1.5
-V2_REFERENCE_CLIP_SIGMAS = 5.0
+STATS_TOLERANCE = 1.5
+REFERENCE_CLIP_SIGMAS = 5.0
 
-# v1-only: plain mean/std reference with a much tighter band. At 0.65 it rejected 38%
-# of R1's clean chunks - ordinary quiet/busy regimes, i.e. the hard negatives - and
+# Legacy-only: plain mean/std reference with a much tighter band. At 0.65 it rejected
+# 38% of R1's clean chunks - ordinary quiet/busy regimes, i.e. the hard negatives - and
 # pushed the natural positive rate from 28.7% to 39.5%. Kept for byte-exact legacy runs.
-STATS_TOLERANCE = 0.65
+LEGACY_STATS_TOLERANCE = 0.65
 
-# --- Pool composition (v2 only; set a control to None to disable it) ---
+# --- Pool composition (set a control to None to disable it) ---
 # The pool is assembled toward an explicit size target by WATER-FILLING: one ceiling is
 # shared by every recording and raised until the target is met, so recordings smaller
 # than the ceiling contribute everything they have and larger ones contribute exactly
@@ -153,7 +145,7 @@ WRITE_FULL_POOLS = True         # also write the uncomposed pools into FULL_OUTP
                                 # every valid sample, no size/rate/share shaping (the
                                 # grouped dev/test split is still assigned)
 
-# --- Grouped evaluation split (v2 only) ---
+# --- Grouped evaluation split ---
 # Assigned per MACHINE-LEVEL RECORDING, so chunks of one recording can never straddle
 # dev/test - a random per-sample split would leak near-duplicate chunks across the
 # boundary. Whole machines are walked in stable-hash order and placed in dev whenever
@@ -168,7 +160,7 @@ MIN_PERIOD_DETECT = 25
 MAX_PERIOD_DETECT = 5000
 MIN_PERIODS_PER_CHUNK = 3   
 MIN_LENGTH_FOR_PERIOD = 150 
-V2_PERIOD_CLIP_SIGMAS = 8.0 # v2 pre-clip before spectral analysis: mild winsorizing so
+PERIOD_CLIP_SIGMAS = 8.0 # pre-clip before spectral analysis: mild winsorizing so
                             # isolated anomalies cannot wreck the detrend or the
                             # spectrum, while genuine waveform peaks (ECG QRS) survive
 # ======================================================================================
@@ -196,11 +188,11 @@ def stable_rank(*parts: object) -> float:
 
 
 def robust_reference(values: np.ndarray) -> Dict[str, float]:
-    """Label-free reference statistics for the representativeness screen (v2).
+    """Label-free reference statistics for the representativeness screen.
 
     The plain mean/std of a series are inflated by its own anomalies, which hands
     exactly the dirtiest recordings the widest tolerance bands. Winsorizing at
-    V2_REFERENCE_CLIP_SIGMAS robust sigmas strips that influence; the chunk under test
+    REFERENCE_CLIP_SIGMAS robust sigmas strips that influence; the chunk under test
     keeps its raw statistics, so unlabelled anomalies inside a "clean" chunk are what
     push it over the line - the point of the screen. A series whose MAD collapses to
     zero (integer counts with long constant runs) is used as-is: clipping everything to
@@ -209,7 +201,7 @@ def robust_reference(values: np.ndarray) -> Dict[str, float]:
     med = float(np.median(values))
     mad_sigma = 1.4826 * float(np.median(np.abs(values - med)))
     if mad_sigma > 1e-10:
-        lim = V2_REFERENCE_CLIP_SIGMAS * mad_sigma
+        lim = REFERENCE_CLIP_SIGMAS * mad_sigma
         w = np.clip(values, med - lim, med + lim)
     else:
         w = values
@@ -272,60 +264,58 @@ class TimeSeriesSampler:
         self,
         split_threshold: int = SPLIT_THRESHOLD,
         base_chunk_size: int = BASE_CHUNK_SIZE,
-        target_chunk_max: int = TARGET_CHUNK_MAX,
+        legacy_target_chunk_max: int = LEGACY_TARGET_CHUNK_MAX,
         absolute_min: int = ABSOLUTE_MIN,
         absolute_max: int = ABSOLUTE_MAX,
-        target_anomaly_ratio: float = TARGET_ANOMALY_RATIO,
-        acceptable_anomaly_ratio: float = ACCEPTABLE_ANOMALY_RATIO,
-        max_anomaly_ratio: float = MAX_ANOMALY_RATIO,
+        legacy_target_anomaly_ratio: float = LEGACY_TARGET_ANOMALY_RATIO,
+        legacy_acceptable_anomaly_ratio: float = LEGACY_ACCEPTABLE_ANOMALY_RATIO,
+        legacy_max_anomaly_ratio: float = LEGACY_MAX_ANOMALY_RATIO,
         anomaly_lookahead: int = ANOMALY_LOOKAHEAD,
+        legacy_stats_tolerance: float = LEGACY_STATS_TOLERANCE,
         stats_tolerance: float = STATS_TOLERANCE,
-        v2_stats_tolerance: float = V2_STATS_TOLERANCE,
         min_period_detect: int = MIN_PERIOD_DETECT,
         max_period_detect: int = MAX_PERIOD_DETECT,
-        logic: str = SAMPLER_LOGIC,
-        v2_max_anomaly_ratio: float = V2_MAX_ANOMALY_RATIO,
+        legacy: bool = LEGACY_SAMPLER,
+        max_anomaly_ratio: float = MAX_ANOMALY_RATIO,
     ) -> None:
-        if logic not in ("v1", "v2"):
-            raise ValueError(f"logic must be 'v1' or 'v2', got {logic!r}")
-        if not 0 < v2_max_anomaly_ratio < 1:
-            raise ValueError(f"v2_max_anomaly_ratio must lie in (0, 1), got {v2_max_anomaly_ratio}")
-        if v2_stats_tolerance <= 0:
-            raise ValueError(f"v2_stats_tolerance must be positive, got {v2_stats_tolerance}")
-        if not 0 < target_anomaly_ratio <= acceptable_anomaly_ratio <= max_anomaly_ratio < 1:
+        if not 0 < max_anomaly_ratio < 1:
+            raise ValueError(f"max_anomaly_ratio must lie in (0, 1), got {max_anomaly_ratio}")
+        if stats_tolerance <= 0:
+            raise ValueError(f"stats_tolerance must be positive, got {stats_tolerance}")
+        if not 0 < legacy_target_anomaly_ratio <= legacy_acceptable_anomaly_ratio <= legacy_max_anomaly_ratio < 1:
             raise ValueError(
                 "anomaly ratios must satisfy 0 < target <= acceptable <= max < 1, got "
-                f"{target_anomaly_ratio}, {acceptable_anomaly_ratio}, {max_anomaly_ratio}"
+                f"{legacy_target_anomaly_ratio}, {legacy_acceptable_anomaly_ratio}, {legacy_max_anomaly_ratio}"
             )
         if not 0 < absolute_min <= base_chunk_size <= absolute_max:
             raise ValueError(
                 "chunk sizes must satisfy 0 < absolute_min <= base_chunk_size <= absolute_max"
             )
-        if logic == "v1" and not base_chunk_size <= target_chunk_max <= absolute_max:
+        if legacy and not base_chunk_size <= legacy_target_chunk_max <= absolute_max:
             raise ValueError(
-                "v1 additionally requires base_chunk_size <= target_chunk_max <= absolute_max"
+                "legacy mode requires base_chunk_size <= legacy_target_chunk_max <= absolute_max"
             )
 
         self.split_threshold = split_threshold
         self.base_chunk_size = base_chunk_size
-        self.target_chunk_max = target_chunk_max
+        self.legacy_target_chunk_max = legacy_target_chunk_max
         self.absolute_min = absolute_min
         self.absolute_max = absolute_max
-        self.target_anomaly_ratio = target_anomaly_ratio
-        self.acceptable_anomaly_ratio = acceptable_anomaly_ratio
-        self.max_anomaly_ratio = max_anomaly_ratio
+        self.legacy_target_anomaly_ratio = legacy_target_anomaly_ratio
+        self.legacy_acceptable_anomaly_ratio = legacy_acceptable_anomaly_ratio
+        self.legacy_max_anomaly_ratio = legacy_max_anomaly_ratio
         self.anomaly_lookahead = anomaly_lookahead
+        self.legacy_stats_tolerance = legacy_stats_tolerance
         self.stats_tolerance = stats_tolerance
-        self.v2_stats_tolerance = v2_stats_tolerance
         self.min_period_detect = min_period_detect
         self.max_period_detect = max_period_detect
-        self.logic = logic
-        self.v2_max_anomaly_ratio = v2_max_anomaly_ratio
+        self.legacy = legacy
+        self.max_anomaly_ratio = max_anomaly_ratio
 
         self.rejected_count = 0     # total dropped samples (all causes)
         self.rejected_budget = 0    # dropped for exceeding the anomaly budget
         self.rejected_repr = 0      # dropped by the representativeness screen
-        self.degenerate_count = 0   # series salvaged for clean stretches only (v1 only)
+        self.degenerate_count = 0   # series salvaged for clean stretches (legacy only)
 
     # ----------------------------------------------------------------------------------
     # Signal analysis
@@ -334,17 +324,17 @@ class TimeSeriesSampler:
     def detect_period(self, values: np.ndarray) -> Optional[int]:
         """Dominant period of a series, from the values alone.
 
-        Dispatches on the logic version: v1 keeps the legacy single-pass ACF scan
-        byte-for-byte; v2 uses the periodogram-plus-ACF detector below, which is robust
-        to anomalies and trend (the legacy detrend through the two literal endpoint
-        values collapses under a single spike at either end: 175/200 -> 8/200 correct
-        on a synthetic ground-truth suite).
+        The legacy mode keeps its single-pass ACF scan byte-for-byte; otherwise the
+        periodogram-plus-ACF detector below is used, which is robust to anomalies and
+        trend (the legacy detrend through the two literal endpoint values collapses
+        under a single spike at either end: 175/200 -> 8/200 correct on a synthetic
+        ground-truth suite).
         """
-        if self.logic == "v1":
-            return self._detect_period_v1(values)
-        return self._detect_period_v2(values)
+        if self.legacy:
+            return self._detect_period_legacy(values)
+        return self._detect_period_robust(values)
 
-    def _detect_period_v1(self, values: np.ndarray) -> Optional[int]:
+    def _detect_period_legacy(self, values: np.ndarray) -> Optional[int]:
         """Legacy detector: first ACF peak after an endpoint-anchored detrend."""
         n = values.size
         max_p = min(self.max_period_detect, n // MIN_PERIODS_PER_CHUNK)
@@ -372,7 +362,7 @@ class TimeSeriesSampler:
                     return lag
         return None
 
-    def _detect_period_v2(self, values: np.ndarray) -> Optional[int]:
+    def _detect_period_robust(self, values: np.ndarray) -> Optional[int]:
         """Periodogram candidates validated and refined on the autocorrelation.
 
         Pipeline (all label-free): least-squares detrend and a mild robust clip, so a
@@ -396,7 +386,7 @@ class TimeSeriesSampler:
         med = np.median(v)
         mad_sigma = 1.4826 * np.median(np.abs(v - med))
         if mad_sigma > 1e-10:
-            lim = V2_PERIOD_CLIP_SIGMAS * mad_sigma
+            lim = PERIOD_CLIP_SIGMAS * mad_sigma
             v = np.clip(v, med - lim, med + lim)
         std = np.std(v)
         if std < 1e-10:
@@ -484,9 +474,9 @@ class TimeSeriesSampler:
     def compute_optimal_chunk_size(self, period: Optional[int]) -> int:
         """Chunk size: start from the base size, round up to whole periods.
 
-        Depends on the values only (via the detected period), never on the labels - under
-        v2 this is the sole source of length variation between series, which is exactly
-        the "real series come in different sizes" property worth keeping.
+        Depends on the values only (via the detected period), never on the labels - this
+        is the sole source of length variation between series, which is exactly the
+        "real series come in different sizes" property worth keeping.
 
         A chunk must span at least MIN_PERIODS_PER_CHUNK whole periods, otherwise it
         cannot show what "normal" repetition looks like; that requirement is what may
@@ -496,9 +486,9 @@ class TimeSeriesSampler:
         if period and period >= self.min_period_detect:
             size = max(size, period * MIN_PERIODS_PER_CHUNK)
             size = ((size + period - 1) // period) * period
-        if self.logic == "v1":
-            # v1 kept a soft cap that could be exceeded only to fit a single period.
-            size = min(size, max(self.target_chunk_max, period or 0))
+        if self.legacy:
+            # The legacy soft cap could be exceeded only to fit a single period.
+            size = min(size, max(self.legacy_target_chunk_max, period or 0))
         return int(np.clip(size, self.absolute_min, self.absolute_max))
 
     def align_boundary(self, pos: int, period: Optional[int], length: int, is_start: bool) -> int:
@@ -546,11 +536,11 @@ class TimeSeriesSampler:
 
         Both tolerances are in units of the reference spread. Scaling the mean tolerance
         by ``|g_mean|`` instead would collapse the band to nothing for a series centred
-        near zero, rejecting almost every clean chunk of it. Under v2 the reference is
-        robust (:func:`robust_reference`) and the band is V2_STATS_TOLERANCE; under v1
-        both keep their legacy plain-stats form.
+        near zero, rejecting almost every clean chunk of it. The reference is robust
+        (:func:`robust_reference`) with band STATS_TOLERANCE; the legacy mode keeps its
+        plain-stats form and tighter band.
         """
-        tol = self.v2_stats_tolerance if self.logic == "v2" else self.stats_tolerance
+        tol = self.stats_tolerance if not self.legacy else self.legacy_stats_tolerance
         scale = max(g_std, 1e-10)
         mean_ok = abs(float(np.mean(chunk)) - g_mean) <= tol * scale
         std_ok = abs(float(np.std(chunk)) - g_std) <= tol * scale
@@ -572,7 +562,7 @@ class TimeSeriesSampler:
     ) -> int:
         """Smallest forward expansion that brings the anomaly ratio down.
 
-        Aims for ``target_anomaly_ratio``, falling back to ``acceptable_anomaly_ratio``
+        Aims for ``legacy_target_anomaly_ratio``, falling back to ``legacy_acceptable_anomaly_ratio``
         only when the target is unreachable. Exact prefix-sum sweep: the ratio is not
         monotonic in ``end``, so a binary search would be unsound.
         """
@@ -589,7 +579,7 @@ class TimeSeriesSampler:
         if lo >= csum.size:
             return end
 
-        for threshold in (self.target_anomaly_ratio, self.acceptable_anomaly_ratio):
+        for threshold in (self.legacy_target_anomaly_ratio, self.legacy_acceptable_anomaly_ratio):
             hits = np.flatnonzero(ratios[lo:] <= threshold)
             if hits.size:
                 return start + lo + int(hits[0])
@@ -636,9 +626,10 @@ class TimeSeriesSampler:
             # chunk that is wildly unlike its parent series is suspicious of unlabelled
             # anomalies (known TSB-UAD label noise), hence the rejection.
             representative = self.check_representativeness(values, g_stats["mean"], g_stats["std"])
-            if not representative and self.logic == "v1":
-                # v1 only: try to rescue the chunk by extending it. Removed under v2 -
-                # extending y=0 samples but never y=1 samples ties length to the label.
+            if not representative and self.legacy:
+                # Legacy only: try to rescue the chunk by extending it. Dropped from the
+                # current logic - extending y=0 samples but never y=1 samples ties
+                # length to the label.
                 expanded_end = min(orig_len, start + self.absolute_max, end + min((end - start) // 5, 2000))
                 if expanded_end > end:
                     candidate = series_df["value"].to_numpy()[start:expanded_end]
@@ -654,10 +645,10 @@ class TimeSeriesSampler:
                 self.rejected_repr += 1
                 return None
 
-        if self.logic == "v2":
-            effective_cap = self.v2_max_anomaly_ratio
+        if not self.legacy:
+            effective_cap = self.max_anomaly_ratio
         else:
-            effective_cap = self.acceptable_anomaly_ratio if ratio_cap is None else ratio_cap
+            effective_cap = self.legacy_acceptable_anomaly_ratio if ratio_cap is None else ratio_cap
         if ratio > effective_cap:
             self.rejected_count += 1
             self.rejected_budget += 1
@@ -696,17 +687,18 @@ class TimeSeriesSampler:
         g_stats: Dict,
         period: Optional[int],
     ) -> Optional[SampleRecord]:
-        """Apply the local anomaly budget to one chunk, diluting it if necessary (v1).
+        """Apply the local anomaly budget to one chunk, diluting it if necessary (legacy).
 
         Purely chunk-local; whole-series strategies are decided in :meth:`process_series`.
-        Under v2 dilution is disabled: the boundary must not move in response to the
-        labels, so the budget is enforced by rejection inside :meth:`_finalize_sample`.
+        Outside the legacy mode dilution is disabled: the boundary must not move in
+        response to the labels, so the budget is enforced by rejection inside
+        :meth:`_finalize_sample`.
         """
-        if self.logic == "v1":
+        if self.legacy:
             labels_full = series_df["label"].to_numpy()
             _, anom_count, ratio = self._recalculate_label(labels_full[start:end])
 
-            if ratio > self.target_anomaly_ratio:
+            if ratio > self.legacy_target_anomaly_ratio:
                 expanded_end = self._optimize_expansion(labels_full, start, end, orig_len)
                 if expanded_end > end:
                     end = expanded_end
@@ -776,7 +768,7 @@ class TimeSeriesSampler:
 
         merged_label = np.concatenate([last.label, labels[start:end]])
         y_i, anom_count, ratio = self._recalculate_label(merged_label)
-        if ratio > self.acceptable_anomaly_ratio:
+        if ratio > self.legacy_acceptable_anomaly_ratio:
             return None
 
         return SampleRecord(
@@ -811,13 +803,13 @@ class TimeSeriesSampler:
         if length == 0:
             return []
 
-        if self.logic == "v2":
+        if not self.legacy:
             g_stats = robust_reference(values)
         else:
             g_stats = {"mean": float(np.mean(values)), "std": float(np.std(values))}
         period = self.detect_period(values) if length >= MIN_LENGTH_FOR_PERIOD else None
 
-        if self.logic == "v2":
+        if not self.legacy:
             # Uniform path for every series: short ones stay whole at their natural
             # length, long ones go on a fixed grid. No label-driven strategies exist, so
             # there is nothing to triage - a degenerate series simply loses its dirty
@@ -836,15 +828,15 @@ class TimeSeriesSampler:
         # Chunking cannot rescue a series whose global ratio already exceeds the budget.
         # Deciding this up front, not per chunk, keeps series_id unique and coverage
         # disjoint.
-        if global_ratio > self.max_anomaly_ratio:
+        if global_ratio > self.legacy_max_anomaly_ratio:
             self.degenerate_count += 1
             return self._extract_clean_chunks(series_df, group, dataset, orig_id, period, g_stats)
 
-        if global_ratio > self.acceptable_anomaly_ratio and length <= self.absolute_max:
+        if global_ratio > self.legacy_acceptable_anomaly_ratio and length <= self.absolute_max:
             record = self._finalize_sample(
                 series_df, group, dataset, orig_id, "full", 0, length,
                 False, length, g_stats, period, notes="whole_series",
-                ratio_cap=self.max_anomaly_ratio,
+                ratio_cap=self.legacy_max_anomaly_ratio,
             )
             return [record] if record else []
 
@@ -868,7 +860,7 @@ class TimeSeriesSampler:
         period: Optional[int],
         g_stats: Dict,
     ) -> List[SampleRecord]:
-        """Split a long series on a fixed, label-independent grid (v2).
+        """Split a long series on a fixed, label-independent grid.
 
         The chunk size is computed once per series from the values alone and already
         rounded to a whole number of periods, so every boundary falls on a period
@@ -905,7 +897,7 @@ class TimeSeriesSampler:
         period: Optional[int],
         g_stats: Dict,
     ) -> List[SampleRecord]:
-        """Split a long series into non-overlapping, budget-respecting chunks (v1)."""
+        """Split a long series into non-overlapping, budget-respecting chunks (legacy)."""
         values = series_df["value"].to_numpy()
         labels = series_df["label"].to_numpy()
         length = values.size
@@ -1021,7 +1013,7 @@ class TimeSeriesSampler:
         composition: Dict[str, object] = {}
         full_counts: Dict[str, object] = {}
         split_map: Optional[Dict[Tuple[str, str], str]] = None
-        if self.logic == "v2":
+        if not self.legacy:
             full_entries = entries
             entries, composition = self._compose_pool(entries)
             # The quota targets the pool people evaluate on; the full pools inherit the
@@ -1049,10 +1041,9 @@ class TimeSeriesSampler:
 
         main_df.to_parquet(output_dir / f"{group}.parquet", index=False)
         meta_df.to_parquet(output_dir / f"{group}_metadata.parquet", index=False)
-        if self.logic == "v2":
+        if not self.legacy:
             manifest = {
-                "sampler_logic": self.logic,
-                "v2_max_anomaly_ratio": self.v2_max_anomaly_ratio,
+                "max_anomaly_ratio": self.max_anomaly_ratio,
                 "target_pool_size": TARGET_POOL_SIZE,
                 "target_positive_rate": TARGET_POSITIVE_RATE,
                 "max_recording_share": MAX_RECORDING_SHARE,
@@ -1145,9 +1136,9 @@ class TimeSeriesSampler:
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Assemble the data and metadata frames for a set of samples.
 
-        Under v2 the grouped dev/test split lands here, from the machine->side mapping of
+        The grouped dev/test split lands here, from the machine->side mapping of
         :meth:`_split_mapping`; a machine absent from that mapping (present only in the
-        full pool because composition dropped it entirely) falls back to the legacy hash
+        full pool because composition dropped it entirely) falls back to the plain hash
         rule, so it still gets a stable side. Correlated series can never straddle the
         evaluation boundary - which is also asserted, not assumed.
         """
@@ -1157,7 +1148,7 @@ class TimeSeriesSampler:
         main_df["value"] = main_df["value"].astype(np.float64)
         main_df["label"] = main_df["label"].astype(np.int8)
 
-        if self.logic == "v2":
+        if not self.legacy:
             keys = [(ds, recording_group(rec_id)) for ds, rec_id, _ in entries]
             hash_side = lambda key: (
                 "dev" if stable_rank(COMPOSITION_SEED, "split", group, *key) < DEV_FRACTION
@@ -1174,7 +1165,7 @@ class TimeSeriesSampler:
         return main_df, meta_df
 
     # ----------------------------------------------------------------------------------
-    # Pool composition (v2)
+    # Pool composition
     # ----------------------------------------------------------------------------------
 
     @staticmethod
@@ -1364,7 +1355,7 @@ class TimeSeriesSampler:
         return kept, stats
 
     def _log_summary(self, group: str, meta_df: pd.DataFrame, output_dir: Path) -> None:
-        logger.info("=== %s COMPLETE (logic=%s) ===", group, self.logic)
+        logger.info("=== %s COMPLETE%s ===", group, " (legacy)" if self.legacy else "")
         logger.info("Total samples: %d", len(meta_df))
         logger.info(
             "Length min/mean/max/std: %d / %.1f / %d / %.1f",
@@ -1418,13 +1409,13 @@ def validate_pool(data: pd.DataFrame, meta: pd.DataFrame, sampler: TimeSeriesSam
     if len(too_long):
         raise AssertionError(f"{len(too_long)} samples longer than absolute_max")
 
-    if sampler.logic == "v2":
+    if not sampler.legacy:
         # One uniform rejection cap for every sample.
-        cap = np.full(len(meta), sampler.v2_max_anomaly_ratio)
+        cap = np.full(len(meta), sampler.max_anomaly_ratio)
     else:
-        # v1: chunk samples are held to the acceptable bound; whole-series to the max.
+        # Legacy: chunk samples are held to the acceptable bound; whole-series to the max.
         whole = meta["source_notes"].fillna("").str.contains("whole_series")
-        cap = np.where(whole, sampler.max_anomaly_ratio, sampler.acceptable_anomaly_ratio)
+        cap = np.where(whole, sampler.legacy_max_anomaly_ratio, sampler.legacy_acceptable_anomaly_ratio)
     over_budget = meta[meta["anomaly_ratio"] > cap + 1e-9]
     if len(over_budget):
         worst = over_budget["anomaly_ratio"].max()

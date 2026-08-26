@@ -41,8 +41,6 @@ import pandas as pd
 from scipy.ndimage import median_filter
 from scipy.signal import lfilter
 
-__version__ = "2.5.0"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -218,7 +216,6 @@ class PoolConfig:
     def to_manifest(self) -> dict:
         """Serialise the configuration for the run manifest."""
         return {
-            "generator_version": __version__,
             "group": self.group,
             "num_series": self.num_series,
             "base_types": list(self.base_types),
@@ -512,8 +509,8 @@ def _draw_segment(
 
     ``forbidden`` lists spans already occupied by earlier events; a placement must keep
     ``margin`` clean samples away from each of them so two events never read as one.
-    With no forbidden spans the first draw is always accepted, which keeps the v1 draw
-    sequence untouched. Returns ``None`` when no placement fits.
+    With no forbidden spans the first draw is always accepted. Returns ``None`` when no
+    placement fits.
     """
     duration = int(np.clip(duration, 4, length))
     for _ in range(30):
@@ -632,7 +629,7 @@ class InjectionContext:
     target_points: int
     base_type: str
     base_params: dict
-    # Spans already occupied by earlier events of the same series (multi-event, v2).
+    # Spans already occupied by earlier events of the same series.
     forbidden: tuple = ()
     # Whitening data for detectability certification (see the CONFIGURATION block).
     whiten: tuple = (1.0,)
@@ -1160,7 +1157,7 @@ def generate_series(index: int, config: PoolConfig, rng: np.random.Generator) ->
             "y_i": int(num_anomalies > 0),
             "is_split": False,
             "original_length": length,
-            "source_notes": f"synthetic;base={base_type};anomaly={anomaly_type};gen={__version__}",
+            "source_notes": f"synthetic;base={base_type};anomaly={anomaly_type}",
             "base_type": base_type,
             "anomaly_type": anomaly_type,
             "anomaly_fraction": round(num_anomalies / length, 6),
