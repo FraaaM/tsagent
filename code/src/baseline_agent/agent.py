@@ -2,25 +2,27 @@
 
 What the harness adds on top of the two pure tool functions in ``tools.py`` is
 bookkeeping only: timing and a trace record around every call (FR6), the record of which
-series were examined, and an output validator that refuses to end the episode while a
-retrieved series still has no verdict (FR4/FR5: "a verdict for each series it examines").
-The validator never asks for more coverage of the pool - stopping early is the agent's own
-decision and is left alone.
+series were examined, the optional id aliasing of ``ids.py``, and an output validator that
+refuses to end the episode while a retrieved series still has no verdict (FR4/FR5: "a
+verdict for each series it examines"). The validator never asks for more coverage of the
+pool - stopping early is the agent's own decision and is left alone.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai import Agent, ModelRetry, RunContext, Tool
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 
+from .ids import IdAliases, PlainIds
 from .pool import Pool
 from .prompt import SYSTEM_PROMPT
 from .tools import get_pool_meta_data as _pool_meta_data
 from .tools import get_series as _get_series
+from .tools import unknown_id_error
 from .trace import TraceRecorder
 from .verdicts import ParsedVerdict, VerdictCollector
 
@@ -35,8 +37,28 @@ class EpisodeDeps:
     pool: Pool
     recorder: TraceRecorder
     collector: VerdictCollector
+    ids: PlainIds | IdAliases | None = None
     value_precision: int | None = None
     enforce_verdicts: bool = True
+    _payload_chars: dict[str, int] = field(default_factory=dict, repr=False)
+    _meta_chars: int | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.ids is None:
+            self.ids = PlainIds(self.pool.series_ids)
+
+    def payload_chars(self, series_id: str) -> int:
+        """Size of the ``get_series`` text for a pool id, computed once per series."""
+        if series_id not in self._payload_chars:
+            self._payload_chars[series_id] = len(
+                _get_series(self.pool, series_id, value_precision=self.value_precision, label=self.ids.display(series_id))
+            )
+        return self._payload_chars[series_id]
+
+    def meta_chars(self) -> int:
+        if self._meta_chars is None:
+            self._meta_chars = len(_pool_meta_data(self.pool, series_ids=self.ids.served))
+        return self._meta_chars
 
 
 def get_series(ctx: RunContext[EpisodeDeps], series_id: str) -> str:
@@ -50,13 +72,19 @@ def get_series(ctx: RunContext[EpisodeDeps], series_id: str) -> str:
         series_id: Identifier of the series, exactly as listed by get_pool_meta_data.
     """
     deps = ctx.deps
+    real = deps.ids.resolve(series_id)
     with deps.recorder.tool_call(
-        "get_series", ctx.tool_call_id, {"series_id": series_id}, request_index=ctx.run_step, series_id=series_id
+        "get_series", ctx.tool_call_id, {"series_id": series_id}, request_index=ctx.run_step, series_id=real if real is not None else series_id
     ) as call:
-        text = _get_series(deps.pool, series_id, value_precision=deps.value_precision)
-        call.finish(text, n_points=deps.pool.length_of(series_id) if series_id in deps.pool else None)
-    if call.ok:
-        deps.collector.mark_examined(series_id)
+        if real is None:
+            # Only names the model was given resolve; with aliasing on, a pool id it may
+            # have guessed from elsewhere is not one of them and the pool is never consulted.
+            text = unknown_id_error(series_id) if series_id.strip() else _get_series(deps.pool, series_id)
+        else:
+            text = _get_series(deps.pool, real, value_precision=deps.value_precision, label=deps.ids.display(real))
+        call.finish(text, n_points=deps.pool.length_of(real) if real is not None else None)
+    if call.ok and real is not None:
+        deps.collector.mark_examined(real)
     return text
 
 
@@ -64,7 +92,7 @@ def get_pool_meta_data(ctx: RunContext[EpisodeDeps]) -> str:
     """Return the pool's metadata: its name, its size and the list of all series ids."""
     deps = ctx.deps
     with deps.recorder.tool_call("get_pool_meta_data", ctx.tool_call_id, {}, request_index=ctx.run_step) as call:
-        text = _pool_meta_data(deps.pool)
+        text = _pool_meta_data(deps.pool, series_ids=deps.ids.served)
         call.finish(text)
     return text
 
@@ -90,7 +118,9 @@ def build_agent(
         deps_type=EpisodeDeps,
         output_type=str,
         instructions=instructions,
-        tools=[Tool(get_series, takes_ctx=True), Tool(get_pool_meta_data, takes_ctx=True)],
+        # sequential: each call runs alone, in the order the model issued them, so the
+        # trace and the examination order never depend on thread timing (FR7).
+        tools=[Tool(get_series, takes_ctx=True, sequential=True), Tool(get_pool_meta_data, takes_ctx=True, sequential=True)],
         model_settings=model_settings,
         retries={"tools": tool_retries, "output": output_retries},
         name=name,
@@ -101,14 +131,14 @@ def build_agent(
         deps = ctx.deps
         # The runner ingests each response as it arrives; this is the fallback for a plain
         # ``agent.run`` and a no-op otherwise (ingestion is idempotent per request).
-        deps.collector.ingest(output, ctx.run_step, deps.pool)
+        deps.collector.ingest(output, ctx.run_step, deps.pool, resolve=deps.ids.resolve)
         if not deps.enforce_verdicts:
             return output
         missing = deps.collector.missing_verdicts()
         if not missing:
             return output
         last = deps.collector.results.get(ctx.run_step)
-        raise ModelRetry(retry_message(missing, last.rejected if last else []))
+        raise ModelRetry(retry_message([deps.ids.display(s) for s in missing], last.rejected if last else []))
 
     return agent
 

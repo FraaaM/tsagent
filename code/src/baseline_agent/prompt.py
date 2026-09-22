@@ -1,12 +1,14 @@
 """Prompts of the raw-retrieval baseline agent.
 
-The system prompt implements the efficiency policy chosen in spec 02, section 4.2: an
-explicit budget instruction (idea B1) plus the stop-when-confident protocol borrowed from
-idea B2. It also fixes the verdict wire format (see ``verdicts.py``) - the agent has no
-output tool, so its text is the only channel for verdicts.
+The system prompt implements the efficiency policy chosen in spec 02, section 4.2: the
+explicit budget instruction of idea B1 - minimise re-quoted raw content, finish in as few
+turns as possible once confident - plus the stop-when-confident element of idea B2, and
+nothing else from B2 (reasoning in indices rather than values was deferred by the spec).
+It also fixes the verdict wire format (see ``verdicts.py``): the agent has no output tool,
+so its text is the only channel for verdicts.
 
-Neither prompt mentions labels, base rates, anomaly counts or anything else the agent
-could not learn through its two tools.
+Neither prompt mentions labels, base rates, pool sizes, series lengths or anything else
+the agent could not learn through its two tools.
 """
 
 from __future__ import annotations
@@ -36,10 +38,10 @@ There are no other tools - no statistics, no detectors, no plots. Every conclusi
 Rules: judge only series whose values you retrieved in this episode - a verdict for a series you did not retrieve is discarded; never invent series ids; you may retrieve a series again and you may re-issue a verdict for it, in which case the last verdict counts.
 
 ## Budget
-Series are long (typically 1,000 to 13,000 points) and the pool is large, so context is your scarcest resource. Keep your text minimal: do not restate or quote raw values beyond the few needed as evidence, do not summarise a series before judging it, do not narrate plans. Refer to positions by index or range instead of reproducing values. Commit to a verdict as soon as you are confident rather than re-reading; retrieving a series again costs its full length a second time.
+Series can be long - thousands of points each - and the pool is large, so context is your scarcest resource. Do not restate raw values in your replies beyond the few you cite as evidence, and do not retrieve a series again unless you need to: each retrieval costs its full length again. Settle each series in as few turns as possible, and commit to a verdict as soon as you are confident.
 
 ## Ending the episode
-The episode ends the moment you reply without calling a tool. Before that, make sure every series you retrieved has a verdict. You are not required to cover the whole pool. Your final message may carry the remaining verdict lines and must end with a single line of the form: DONE <number of series examined>
+The episode ends the moment you reply without calling a tool. Before that, make sure every series you retrieved has a verdict. Your final message may carry the remaining verdict lines and must end with a single line of the form: DONE <number of series examined>
 """
 
 USER_PROMPT = "Triage the pool. Begin by calling get_pool_meta_data."

@@ -10,8 +10,9 @@ Token attribution
 Providers report usage per request, not per series, and one request can carry the payloads
 of several series. The trace therefore charges each request to the series whose
 ``get_series`` payloads that request consumed - the successful calls executed right
-before it - splitting the request's usage equally between them. Requests that consumed
-no series payload (the first turn, the metadata turn, the final message, retries) are
+before it - splitting the request's usage equally between them. A request that follows no
+successful ``get_series`` (the prompt-only first turn, the turn after
+``get_pool_meta_data``, retries, a closing message sent without a retrieval before it) is
 booked as overhead. Shares are fractional so that they add up exactly to the run totals,
 which ``test_runner.py`` checks.
 """
@@ -29,6 +30,8 @@ from .pool import Pool
 from .schemas import (
     AttributedUsage,
     ModelRequestRecord,
+    RetryCounts,
+    RetryKind,
     RunEndRecord,
     RunStartRecord,
     SeriesCounts,
@@ -39,6 +42,8 @@ from .schemas import (
     UsageFields,
     VerdictCounts,
     VerdictEvent,
+    zero_attributed,
+    zero_usage,
 )
 from .tools import is_error
 from .verdicts import VerdictCollector
@@ -50,7 +55,7 @@ def now_iso() -> str:
 
 
 def usage_fields(usage: Any) -> UsageFields:
-    """Convert a pydantic-ai ``RequestUsage`` / ``RunUsage`` into the trace's flat form."""
+    """Convert a pydantic-ai ``RequestUsage`` / ``RunUsage`` (or a ``UsageFields``) into the trace's flat form."""
     details = {str(k): int(v) for k, v in (getattr(usage, "details", None) or {}).items()}
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
@@ -109,7 +114,7 @@ class TraceRecorder:
         self.requests: list[ModelRequestRecord] = []
         self.verdict_events: list[VerdictEvent] = []
         self.series: OrderedDict[str, _SeriesStats] = OrderedDict()
-        self.n_retries = 0
+        self.retries: dict[str, int] = {"tool": 0, "output": 0}
         self._t0 = time.perf_counter()
         self._started_at = now_iso()
 
@@ -141,7 +146,8 @@ class TraceRecorder:
     def invalid_tool_call(self, tool_name: str, tool_call_id: str | None, args: Any, error: str, *, request_index: int) -> None:
         """A call the harness refused to execute (bad arguments or unknown tool)."""
         raw_args = args if isinstance(args, dict) else {"raw": args}
-        handle = ToolCallHandle(tool_name, tool_call_id or "", raw_args, raw_args.get("series_id") if isinstance(raw_args.get("series_id"), str) else None)
+        sid = raw_args.get("series_id")
+        handle = ToolCallHandle(tool_name, tool_call_id or "", raw_args, sid if isinstance(sid, str) else None)
         handle.error = error
         self._record_call(handle, request_index, now_iso(), 0.0)
 
@@ -176,7 +182,7 @@ class TraceRecorder:
         self,
         *,
         request_index: int,
-        is_retry: bool,
+        retry_kind: RetryKind | None,
         started_at: str,
         duration_ms: float,
         usage: Any,
@@ -191,7 +197,8 @@ class TraceRecorder:
     ) -> ModelRequestRecord:
         record = ModelRequestRecord(
             request_index=request_index,
-            is_retry=is_retry,
+            is_retry=retry_kind is not None,
+            retry_kind=retry_kind,
             started_at=started_at,
             duration_ms=round(duration_ms, 3),
             usage=usage_fields(usage),
@@ -204,8 +211,8 @@ class TraceRecorder:
             verdicts_accepted=verdicts_accepted,
             verdicts_rejected=verdicts_rejected,
         )
-        if is_retry:
-            self.n_retries += 1
+        if retry_kind is not None:
+            self.retries[retry_kind] += 1
         self.requests.append(record)
         self.writer.write(record)
         return record
@@ -218,6 +225,9 @@ class TraceRecorder:
             if record.series_id in self.pool:
                 stats = self.series.setdefault(record.series_id, _SeriesStats())
                 self._touch(stats, record.request_index)
+
+    def total_tokens(self) -> int:
+        return sum(r.usage.total_tokens for r in self.requests)
 
     def finish(self, termination: Termination, collector: VerdictCollector) -> RunEndRecord:
         """Write the per-series roll-ups and the ``run_end`` record; returns the latter."""
@@ -236,12 +246,12 @@ class TraceRecorder:
                     tool_time_ms=round(stats.tool_time_ms, 3),
                     verdict=verdict.verdict if verdict else None,
                     verdict_revisions=collector.revisions.get(sid, 0),
-                    attributed_usage=attributed.get(sid, AttributedUsage()),
+                    attributed_usage=attributed.get(sid, zero_attributed()),
                 )
             )
         finals = collector.records()
         n_anomalous = sum(r.verdict == "anomalous" for r in finals)
-        totals = UsageFields()
+        totals = zero_usage()
         for r in self.requests:
             totals = UsageFields(
                 input_tokens=totals.input_tokens + r.usage.input_tokens,
@@ -256,7 +266,7 @@ class TraceRecorder:
             duration_ms=round((time.perf_counter() - self._t0) * 1000.0, 3),
             termination=termination,
             requests=len(self.requests),
-            retries=self.n_retries,
+            retries=RetryCounts(tool=self.retries["tool"], output=self.retries["output"]),
             tool_calls=ToolCallCounts(
                 get_series=sum(c.tool_name == "get_series" for c in self.tool_calls),
                 get_pool_meta_data=sum(c.tool_name == "get_pool_meta_data" for c in self.tool_calls),

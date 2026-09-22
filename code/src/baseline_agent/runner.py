@@ -2,14 +2,19 @@
 
 ``run_episode`` drives the pydantic-ai graph step by step (``agent.iter``) so that every
 model round trip can be timed and its usage recorded, and so that the verdict lines in each
-response are captured the moment they arrive - not only at the end. Whatever ends the
-episode (the agent stopping, a usage limit, a provider error, Ctrl-C), the outputs are
-closed properly: ``anomaly_verdicts.jsonl`` holds the standing verdicts,
+response are captured the moment they arrive - not only at the end. Tool calls run one at
+a time in the order the model issued them, which keeps the trace replayable when a model
+batches several ``get_series`` calls into one turn.
+
+Whatever ends the episode - the agent stopping, the harness projecting that the next
+request would break the token budget, a pydantic-ai usage limit, a provider error, Ctrl-C -
+the outputs are closed properly: ``anomaly_verdicts.jsonl`` holds the standing verdicts,
 ``decision_trace.jsonl`` ends with a ``run_end`` record naming the termination reason,
-``messages.json`` holds the full conversation, ``summary.json`` the headline numbers.
+``messages.json`` holds the conversation as pydantic-ai kept it, ``summary.json`` the
+headline numbers.
 
 ``compare_runs`` is the FR7 check: two output directories are equal field-for-field once
-wall-clock timing and provider-generated ids are set aside.
+wall-clock timing, provider-generated ids and cache accounting are set aside.
 """
 
 from __future__ import annotations
@@ -18,8 +23,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import platform
-import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,19 +35,23 @@ from pydantic_ai import Agent, UsageLimits
 from pydantic_ai import messages as M
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
 from pydantic_ai.messages import ModelMessagesTypeAdapter
-from pydantic_ai.models import Model
+from pydantic_ai.models import Model, ModelRequestParameters
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 
 from .agent import TOOL_NAMES, EpisodeDeps, build_agent, registered_tool_names
-from .models import build_model
+from .ids import IdAliases, PlainIds
+from .models import SCRIPTED, build_model
 from .pool import Pool
 from .prompt import SYSTEM_PROMPT, USER_PROMPT, prompt_fingerprint
 from .schemas import (
     LimitsInfo,
     ModelInfo,
+    ModelRequestRecord,
     PoolInfo,
     PromptInfo,
     RetriesInfo,
+    RetryKind,
     RunEndRecord,
     RunStartRecord,
     Termination,
@@ -60,11 +69,27 @@ VERDICTS_FILE = "anomaly_verdicts.jsonl"
 TRACE_FILE = "decision_trace.jsonl"
 MESSAGES_FILE = "messages.json"
 SUMMARY_FILE = "summary.json"
+ALIASES_FILE = "series_aliases.json"
 
-# Fields that legitimately differ between two replays of the same configuration.
-NONDETERMINISTIC_TRACE_FIELDS = frozenset({"tool_call_id"})
-NONDETERMINISTIC_MESSAGE_FIELDS = frozenset(
-    {"timestamp", "tool_call_id", "run_id", "conversation_id", "provider_response_id", "provider_details", "provider_name", "provider_url", "id"}
+# Fields that legitimately differ between two replays of the same configuration: generated
+# ids, wall-clock stamps, and the provider's cache accounting (a warm prompt cache changes
+# how tokens are billed, not what the model saw or said).
+REPLAY_VARIANT_TRACE_FIELDS = frozenset({"tool_call_id", "cache_read_tokens", "cache_write_tokens", "details"})
+REPLAY_VARIANT_MESSAGE_FIELDS = frozenset(
+    {
+        "timestamp",
+        "tool_call_id",
+        "run_id",
+        "conversation_id",
+        "provider_response_id",
+        "provider_details",
+        "provider_name",
+        "provider_url",
+        "id",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "details",
+    }
 )
 
 
@@ -76,11 +101,16 @@ class EpisodeConfig:
     temperature: float | None = 0.0
     seed: int | None = 42
     max_tokens: int | None = None
-    parallel_tool_calls: bool | None = None
+    parallel_tool_calls: bool | None = False
     extra_model_settings: dict[str, Any] = field(default_factory=dict)
+    order_seed: int | None = None  # None: serve the pool in file order
+    alias_series_ids: bool = False
     request_limit: int | None = None  # None: 2 requests per series + 8
-    tool_calls_limit: int | None = None
+    tool_calls_limit: int | None = None  # None: 2 calls per series + 8
     total_tokens_limit: int | None = 1_000_000
+    context_tokens_limit: int | None = None  # None: rely on the provider's own window
+    chars_per_token_estimate: float = 1.5  # conservative for numeric JSON (measured 1.6-2.2)
+    output_allowance_tokens: int = 1024  # expected response size when max_tokens is unset
     tool_retries: int = 1
     output_retries: int = 2
     enforce_verdicts: bool = True
@@ -106,17 +136,32 @@ class EpisodeConfig:
     def effective_request_limit(self, n_series: int) -> int | None:
         return self.request_limit if self.request_limit is not None else 2 * n_series + 8
 
+    def effective_tool_calls_limit(self, n_series: int) -> int | None:
+        return self.tool_calls_limit if self.tool_calls_limit is not None else 2 * n_series + 8
+
     def usage_limits(self, n_series: int) -> UsageLimits:
         return UsageLimits(
             request_limit=self.effective_request_limit(n_series),
-            tool_calls_limit=self.tool_calls_limit,
+            tool_calls_limit=self.effective_tool_calls_limit(n_series),
             total_tokens_limit=self.total_tokens_limit,
+        )
+
+    def limits_info(self, n_series: int) -> LimitsInfo:
+        return LimitsInfo(
+            request_limit=self.effective_request_limit(n_series),
+            tool_calls_limit=self.effective_tool_calls_limit(n_series),
+            total_tokens_limit=self.total_tokens_limit,
+            context_tokens_limit=self.context_tokens_limit,
+            chars_per_token_estimate=float(self.chars_per_token_estimate),
+            output_allowance_tokens=self.output_allowance_tokens,
         )
 
     def fingerprint(self) -> str:
         """Identity of the configuration - excludes the endpoint address, which is deployment, not behaviour."""
         payload = asdict(self)
         payload.pop("provider_base_url")
+        if self.model != SCRIPTED:
+            payload.pop("scripted_options")  # only the stand-in reads them
         payload["system_prompt"] = prompt_fingerprint(self.system_prompt)
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -132,6 +177,24 @@ class EpisodeResult:
     @property
     def usage(self) -> UsageFields:
         return self.run_end.usage
+
+
+class _RecordingModel(WrapperModel):
+    """Keeps every response the model returned, so one that pydantic-ai drops after a
+    usage limit trips can still be booked exactly (usage, details, verdict text)."""
+
+    def __init__(self, wrapped: Model):
+        super().__init__(wrapped)
+        self.last_response: M.ModelResponse | None = None
+        self.responses = 0
+
+    async def request(
+        self, messages: list[M.ModelMessage], model_settings: ModelSettings | None, model_request_parameters: ModelRequestParameters
+    ) -> M.ModelResponse:
+        response = await super().request(messages, model_settings, model_request_parameters)
+        self.last_response = response
+        self.responses += 1
+        return response
 
 
 # --- the episode ------------------------------------------------------------------------
@@ -167,8 +230,9 @@ async def run_episode_async(
 
     if model is None:
         model = build_model(config.model, base_url=config.provider_base_url, api_key=api_key, scripted_options=config.scripted_options)
+    recording = _RecordingModel(model)
     agent = build_agent(
-        model,
+        recording,
         model_settings=config.model_settings(),
         instructions=config.system_prompt,
         tool_retries=config.tool_retries,
@@ -178,21 +242,32 @@ async def run_episode_async(
     if sorted(tools) != sorted(TOOL_NAMES):
         raise RuntimeError(f"agent exposes tools {tools}, expected exactly {list(TOOL_NAMES)}")
 
+    served = pool.reordered(config.order_seed)
+    ids = IdAliases(served.series_ids) if config.alias_series_ids else PlainIds(served.series_ids)
     run_id = hashlib.sha256((pool.fingerprint + config.fingerprint()).encode()).hexdigest()[:12]
     collector = VerdictCollector()
     verdict_writer = VerdictWriter(files[VERDICTS_FILE])
     trace_writer = JsonlWriter(files[TRACE_FILE])
-    recorder = TraceRecorder(trace_writer, pool)
-    deps = EpisodeDeps(pool=pool, recorder=recorder, collector=collector, value_precision=config.value_precision, enforce_verdicts=config.enforce_verdicts)
-    limits = config.usage_limits(len(pool))
+    recorder = TraceRecorder(trace_writer, served)
+    deps = EpisodeDeps(
+        pool=served,
+        recorder=recorder,
+        collector=collector,
+        ids=ids,
+        value_precision=config.value_precision,
+        enforce_verdicts=config.enforce_verdicts,
+    )
+    limits = config.usage_limits(len(served))
 
     recorder.start(
         RunStartRecord(
             run_id=run_id,
             config_fingerprint=config.fingerprint(),
             pool=PoolInfo(name=pool.name, path=pool.source, n_series=len(pool), fingerprint=pool.fingerprint),
+            order_seed=config.order_seed,
+            series_id_aliasing=config.alias_series_ids,
             model=ModelInfo(name=config.model, settings=dict(config.model_settings() or {}), provider_base_url=config.provider_base_url),
-            usage_limits=LimitsInfo(request_limit=limits.request_limit, tool_calls_limit=limits.tool_calls_limit, total_tokens_limit=limits.total_tokens_limit),
+            usage_limits=config.limits_info(len(served)),
             retries=RetriesInfo(tools=config.tool_retries, output=config.output_retries),
             prompt=PromptInfo(system_prompt_sha256=prompt_fingerprint(config.system_prompt), user_prompt=config.user_prompt),
             tools=tools,
@@ -201,13 +276,27 @@ async def run_episode_async(
             started_at=now_iso(),
         )
     )
-    logger.info("run %s: pool %s (%d series), model %s, request limit %s", run_id, pool.name, len(pool), config.model, limits.request_limit)
+    if ids.aliased:
+        files[ALIASES_FILE] = output_dir / ALIASES_FILE
+        write_json(files[ALIASES_FILE], ids.mapping())
+    logger.info(
+        "run %s: pool %s (%d series, order seed %s, aliases %s), model %s, limits: %s requests, %s tool calls, %s tokens",
+        run_id,
+        pool.name,
+        len(served),
+        config.order_seed,
+        "on" if ids.aliased else "off",
+        config.model,
+        limits.request_limit,
+        limits.tool_calls_limit,
+        limits.total_tokens_limit,
+    )
 
     try:
-        termination, messages = await _drive(agent, deps, config, limits, verdict_writer)
+        termination, messages = await _drive(agent, recording, deps, config, limits, verdict_writer)
     except BaseException:
-        # Anything _drive did not translate into a termination (SystemExit, task cancellation)
-        # still leaves a closed trace behind.
+        # Anything _drive did not translate into a termination (SystemExit, a second
+        # Ctrl-C) still leaves a closed trace behind.
         recorder.finish(Termination(reason="interrupted", detail="aborted before completion"), collector)
         trace_writer.close()
         raise
@@ -229,7 +318,7 @@ async def run_episode_async(
         run_end.requests,
         run_end.tool_calls.get_series,
         run_end.series.verdicted,
-        len(pool),
+        len(served),
         run_end.series.anomalous,
         run_end.usage.total_tokens,
     )
@@ -238,6 +327,7 @@ async def run_episode_async(
 
 async def _drive(
     agent: Agent[EpisodeDeps, str],
+    recording: _RecordingModel,
     deps: EpisodeDeps,
     config: EpisodeConfig,
     limits: UsageLimits,
@@ -248,18 +338,18 @@ async def _drive(
     request_index = 0
     termination = Termination(reason="completed")
     run: Any = None
-    pending: dict[str, Any] | None = None  # timing of a request in flight
+    pending: dict[str, Any] | None = None  # timing of the request in flight
 
-    def _record_response(response: M.ModelResponse, *, started_at: str, duration_ms: float, is_retry: bool, history_chars: int) -> None:
+    def _record_response(response: M.ModelResponse, *, started_at: str, duration_ms: float, retry_kind: RetryKind | None, history_chars: int) -> ModelRequestRecord:
         text = "\n".join(p.content for p in response.parts if isinstance(p, M.TextPart))
         tool_parts = [p for p in response.parts if isinstance(p, M.ToolCallPart)]
-        ingest = collector.ingest(text, request_index, pool)
+        ingest = collector.ingest(text, request_index, pool, resolve=deps.ids.resolve)
         for rec in ingest.accepted:
             verdict_writer.put(rec)
         requested = [str(_args_as_dict(p).get("series_id")) for p in tool_parts if p.tool_name == "get_series"]
-        recorder.model_request(
+        record = recorder.model_request(
             request_index=request_index,
-            is_retry=is_retry,
+            retry_kind=retry_kind,
             started_at=started_at,
             duration_ms=duration_ms,
             usage=response.usage,
@@ -285,89 +375,127 @@ async def _drive(
             len(ingest.rejected),
             len(collector.final),
         )
+        return record
 
     try:
-        async with agent.iter(config.user_prompt, deps=deps, usage_limits=limits) as run:
-            node = run.next_node
-            while not Agent.is_end_node(node):
-                if Agent.is_model_request_node(node):
-                    request_index += 1
-                    history = list(run.all_messages())
-                    if not history or history[-1] is not node.request:
-                        history.append(node.request)
-                    pending = {
-                        "is_retry": any(isinstance(p, M.RetryPromptPart) for p in node.request.parts),
-                        "history_chars": history_chars(history, instructions=config.system_prompt),
-                        "started_at": now_iso(),
-                        "t0": time.perf_counter(),
-                    }
-                    next_node = await run.next(node)
-                    duration_ms = (time.perf_counter() - pending["t0"]) * 1000.0
-                    if Agent.is_call_tools_node(next_node):
-                        _record_response(
-                            next_node.model_response,
-                            started_at=pending["started_at"],
-                            duration_ms=duration_ms,
-                            is_retry=pending["is_retry"],
-                            history_chars=pending["history_chars"],
-                        )
-                    pending = None
-                    node = next_node
-                elif Agent.is_call_tools_node(node):
-                    async with node.stream(run.ctx) as stream:
-                        async for event in stream:
-                            if isinstance(event, M.FunctionToolResultEvent) and isinstance(event.part, M.RetryPromptPart):
-                                recorder.invalid_tool_call(
-                                    event.part.tool_name or "?",
-                                    event.part.tool_call_id,
-                                    _args_of(node.model_response, event.part.tool_call_id),
-                                    event.part.model_response(),
-                                    request_index=request_index,
-                                )
-                    node = await run.next(node)
-                else:
-                    node = await run.next(node)
+        with Agent.parallel_tool_call_execution_mode("sequential"):
+            async with agent.iter(config.user_prompt, deps=deps, usage_limits=limits) as run:
+                node = run.next_node
+                while not Agent.is_end_node(node):
+                    if Agent.is_model_request_node(node):
+                        request_index += 1
+                        history = list(run.all_messages())
+                        if not history or history[-1] is not node.request:
+                            history.append(node.request)
+                        pending = {
+                            "retry_kind": _retry_kind(node.request.parts),
+                            "history_chars": history_chars(history, instructions=config.system_prompt),
+                            "started_at": now_iso(),
+                            "t0": time.perf_counter(),
+                        }
+                        next_node = await run.next(node)
+                        duration_ms = (time.perf_counter() - pending["t0"]) * 1000.0
+                        stop: Termination | None = None
+                        if Agent.is_call_tools_node(next_node):
+                            record = _record_response(
+                                next_node.model_response,
+                                started_at=pending["started_at"],
+                                duration_ms=duration_ms,
+                                retry_kind=pending["retry_kind"],
+                                history_chars=pending["history_chars"],
+                            )
+                            stop = _budget_stop(record, next_node.model_response, deps, config)
+                        pending = None
+                        if stop is not None:
+                            termination = stop
+                            break
+                        node = next_node
+                    elif Agent.is_call_tools_node(node):
+                        async with node.stream(run.ctx) as stream:
+                            async for event in stream:
+                                if isinstance(event, M.FunctionToolResultEvent) and isinstance(event.part, M.RetryPromptPart):
+                                    recorder.invalid_tool_call(
+                                        event.part.tool_name or "?",
+                                        event.part.tool_call_id,
+                                        _args_of(node.model_response, event.part.tool_call_id),
+                                        event.part.model_response(),
+                                        request_index=request_index,
+                                    )
+                        node = await run.next(node)
+                    else:
+                        node = await run.next(node)
     except UsageLimitExceeded as exc:
         termination = Termination(reason="usage_limit", detail=_short(exc))
     except UnexpectedModelBehavior as exc:
         termination = Termination(reason="protocol_error", detail=_short(exc))
-    except KeyboardInterrupt:
-        termination = Termination(reason="interrupted", detail="KeyboardInterrupt")
+    except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+        # Under asyncio.run a Ctrl-C arrives as a cancellation of this task.
+        termination = Termination(reason="interrupted", detail=type(exc).__name__)
     except Exception as exc:  # provider/API failures: recorded, not swallowed silently
         logger.exception("episode aborted during request %d", request_index)
         termination = Termination(reason="model_error", detail=_short(exc))
 
     messages = list(run.all_messages()) if run is not None else []
-    if run is not None and pending is not None:
-        # A limit that trips *after* a response was received (total_tokens_limit) leaves
-        # the run's usage one request ahead of the trace. Book that response - from the
-        # history when pydantic-ai kept it, from the usage totals when it did not - so the
-        # trace never under-reports what the provider charged.
-        responses = [m for m in messages if isinstance(m, M.ModelResponse)]
-        duration_ms = (time.perf_counter() - pending["t0"]) * 1000.0
-        if len(responses) > len(recorder.requests):
-            _record_response(responses[-1], started_at=pending["started_at"], duration_ms=duration_ms, is_retry=pending["is_retry"], history_chars=pending["history_chars"])
-        elif run.usage.requests > len(recorder.requests):
-            recorder.model_request(
-                request_index=request_index,
-                is_retry=pending["is_retry"],
-                started_at=pending["started_at"],
-                duration_ms=duration_ms,
-                usage=_usage_delta(run.usage, recorder.requests),
-                model_name=None,
-                finish_reason=None,
-                history_chars=pending["history_chars"],
-                response_text_chars=0,
-                n_tool_calls=0,
-                requested_series=[],
-                verdicts_accepted=0,
-                verdicts_rejected=0,
-            )
-            termination = Termination(
-                reason=termination.reason,
-                detail=f"{termination.detail} [the last response was charged but not retained by the harness; its usage is booked from the run totals]",
-            )
+    if pending is not None and recording.responses > len(recorder.requests) and recording.last_response is not None:
+        # A limit that trips *after* a response arrives (total_tokens_limit) makes
+        # pydantic-ai drop that response before it reaches the history. The wrapper kept
+        # it, so it is booked like any other - usage, details and verdict lines included.
+        _record_response(
+            recording.last_response,
+            started_at=pending["started_at"],
+            duration_ms=(time.perf_counter() - pending["t0"]) * 1000.0,
+            retry_kind=pending["retry_kind"],
+            history_chars=pending["history_chars"],
+        )
+        if not any(m is recording.last_response for m in messages):
+            messages.append(recording.last_response)
     return termination, messages
+
+
+# --- budget projection ------------------------------------------------------------------
+
+
+def _budget_stop(record: ModelRequestRecord, response: M.ModelResponse, deps: EpisodeDeps, config: EpisodeConfig) -> Termination | None:
+    """Decide, before any tool of ``response`` runs, whether the request that would follow
+    it fits the budget. pydantic-ai checks token limits after a response has been paid for
+    - and the request after a retrieval is the expensive one - so the projection here is
+    what keeps a capped run under its cap and free of retrieved-but-unjudged series."""
+    tool_parts = [p for p in response.parts if isinstance(p, M.ToolCallPart)]
+    if not tool_parts or (config.total_tokens_limit is None and config.context_tokens_limit is None):
+        return None
+    cpt = config.chars_per_token_estimate
+    context = record.usage.input_tokens if record.usage.input_tokens > 0 else math.ceil(record.history_chars / cpt)
+    payload_chars = 0
+    requested: list[str] = []
+    for part in tool_parts:
+        if part.tool_name == "get_series":
+            sid = _args_as_dict(part).get("series_id")
+            real = deps.ids.resolve(sid) if isinstance(sid, str) else None
+            payload_chars += deps.payload_chars(real) if real is not None else 160
+            requested.append(str(sid))
+        elif part.tool_name == "get_pool_meta_data":
+            payload_chars += deps.meta_chars()
+        else:
+            payload_chars += 160
+    payload_tokens = math.ceil(payload_chars / cpt)
+    next_input = context + record.usage.output_tokens + payload_tokens
+    allowance = config.max_tokens if config.max_tokens is not None else config.output_allowance_tokens
+    breakdown = f"context {context:,} + response {record.usage.output_tokens:,} + requested payloads ~{payload_tokens:,}"
+    if config.context_tokens_limit is not None and next_input + allowance > config.context_tokens_limit:
+        return Termination(
+            reason="budget",
+            detail=f"the next request would need about {next_input:,} input tokens ({breakdown}) plus {allowance:,} for the reply, "
+            f"over context_tokens_limit={config.context_tokens_limit:,}; not fetched: {requested}",
+        )
+    spent = deps.recorder.total_tokens()
+    projected = spent + next_input + allowance
+    if config.total_tokens_limit is not None and projected > config.total_tokens_limit:
+        return Termination(
+            reason="budget",
+            detail=f"the next request would bring the episode to about {projected:,} tokens ({spent:,} spent + {next_input:,} input [{breakdown}] "
+            f"+ {allowance:,} reply allowance), over total_tokens_limit={config.total_tokens_limit:,}; not fetched: {requested}",
+        )
+    return None
 
 
 # --- helpers ----------------------------------------------------------------------------
@@ -376,15 +504,15 @@ async def _drive(
 def history_chars(messages: Sequence[M.ModelMessage], *, instructions: str | None = None) -> int:
     """Size in characters of everything the model is sent - a provider-independent context measure.
 
-    ``instructions`` is counted once when no request in ``messages`` carries them yet
-    (pydantic-ai attaches the system prompt while preparing the first request).
+    pydantic-ai stamps the instructions on every request it keeps in the history but sends
+    them once, so they are counted once: the latest copy in the history, or ``instructions``
+    when none is there yet (before the first request is prepared).
     """
     total = 0
-    carried = False
+    carried: str | None = None
     for msg in messages:
         if isinstance(msg, M.ModelRequest) and msg.instructions:
-            total += len(msg.instructions)
-            carried = True
+            carried = msg.instructions
         for part in msg.parts:
             if isinstance(part, M.ToolReturnPart):
                 total += len(part.model_response_str())
@@ -395,19 +523,15 @@ def history_chars(messages: Sequence[M.ModelMessage], *, instructions: str | Non
             else:
                 content = getattr(part, "content", "")
                 total += len(content) if isinstance(content, str) else len(json.dumps(content, default=str))
-    if instructions and not carried:
-        total += len(instructions)
+    total += len((carried if carried is not None else (instructions or "")).strip())
     return total
 
 
-def _usage_delta(total: Any, recorded: Sequence[Any]) -> UsageFields:
-    """Run usage minus what the trace has booked so far - the share of the unrecorded response."""
-    return UsageFields(
-        input_tokens=int(total.input_tokens) - sum(r.usage.input_tokens for r in recorded),
-        output_tokens=int(total.output_tokens) - sum(r.usage.output_tokens for r in recorded),
-        cache_read_tokens=int(total.cache_read_tokens) - sum(r.usage.cache_read_tokens for r in recorded),
-        cache_write_tokens=int(total.cache_write_tokens) - sum(r.usage.cache_write_tokens for r in recorded),
-    )
+def _retry_kind(parts: Sequence[Any]) -> RetryKind | None:
+    retries = [p for p in parts if isinstance(p, M.RetryPromptPart)]
+    if not retries:
+        return None
+    return "tool" if any(p.tool_name for p in retries) else "output"
 
 
 def _args_as_dict(part: M.ToolCallPart) -> dict[str, Any]:
@@ -458,20 +582,20 @@ def _first_difference(a: list[Any], b: list[Any], label: str) -> str | None:
 
 
 def compare_runs(dir_a: str | Path, dir_b: str | Path, *, compare_messages: bool = True) -> RunDiff:
-    """Field-for-field equality of two episode outputs, ignoring timing and generated ids."""
+    """Field-for-field equality of two episode outputs, ignoring timing, generated ids and cache accounting."""
     dir_a, dir_b = Path(dir_a), Path(dir_b)
     diffs: list[str] = []
     d = _first_difference(read_jsonl(dir_a / VERDICTS_FILE), read_jsonl(dir_b / VERDICTS_FILE), VERDICTS_FILE)
     if d:
         diffs.append(d)
-    trace_a = _strip(strip_timing(read_jsonl(dir_a / TRACE_FILE)), NONDETERMINISTIC_TRACE_FIELDS)
-    trace_b = _strip(strip_timing(read_jsonl(dir_b / TRACE_FILE)), NONDETERMINISTIC_TRACE_FIELDS)
+    trace_a = _strip(strip_timing(read_jsonl(dir_a / TRACE_FILE)), REPLAY_VARIANT_TRACE_FIELDS)
+    trace_b = _strip(strip_timing(read_jsonl(dir_b / TRACE_FILE)), REPLAY_VARIANT_TRACE_FIELDS)
     d = _first_difference(trace_a, trace_b, TRACE_FILE)
     if d:
         diffs.append(d)
     if compare_messages:
-        msgs_a = _strip(json.loads((dir_a / MESSAGES_FILE).read_text(encoding="utf-8")), NONDETERMINISTIC_MESSAGE_FIELDS)
-        msgs_b = _strip(json.loads((dir_b / MESSAGES_FILE).read_text(encoding="utf-8")), NONDETERMINISTIC_MESSAGE_FIELDS)
+        msgs_a = _strip(json.loads((dir_a / MESSAGES_FILE).read_text(encoding="utf-8")), REPLAY_VARIANT_MESSAGE_FIELDS)
+        msgs_b = _strip(json.loads((dir_b / MESSAGES_FILE).read_text(encoding="utf-8")), REPLAY_VARIANT_MESSAGE_FIELDS)
         d = _first_difference(msgs_a, msgs_b, MESSAGES_FILE)
         if d:
             diffs.append(d)

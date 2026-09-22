@@ -214,10 +214,12 @@ def _requested_id(error_text: str) -> str:
 
 
 def _history_text(messages: list[M.ModelMessage]) -> str:
+    """What a provider would receive: the history plus the instructions once."""
     chunks: list[str] = []
+    instructions: str | None = None
     for msg in messages:
         if isinstance(msg, M.ModelRequest) and msg.instructions:
-            chunks.append(msg.instructions)
+            instructions = msg.instructions
         for part in msg.parts:
             if isinstance(part, M.ToolReturnPart):
                 chunks.append(part.model_response_str())
@@ -226,6 +228,8 @@ def _history_text(messages: list[M.ModelMessage]) -> str:
             else:
                 content = getattr(part, "content", "")
                 chunks.append(content if isinstance(content, str) else json.dumps(content, default=str))
+    if instructions:
+        chunks.append(instructions)
     return "\n".join(chunks)
 
 

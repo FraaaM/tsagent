@@ -7,8 +7,9 @@ appear (bare lines, code fences, pretty-printed objects, arrays, surrounding pro
 strict about *what* they must contain, which is exactly :class:`VerdictRecord`.
 
 :class:`VerdictCollector` applies the episode rules on top of parsing: a verdict counts
-only for a series the agent actually retrieved, the last verdict for a series wins, and
-everything - accepted or rejected - is reported back so the trace can record it.
+only for a series the agent actually retrieved, the last verdict for a series wins, a
+restated verdict changes nothing, and everything - accepted or rejected - is reported
+back so the trace can record it.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import json
 import re
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Collection, Iterable
+from typing import Any, Callable, Collection
 
 from pydantic import ValidationError
 
@@ -25,6 +26,7 @@ from .schemas import VERDICT_VALUES, VerdictRecord
 
 _DECODER = json.JSONDecoder()
 _VERDICT_KEYS = frozenset({"series_id", "verdict", "explanation"})
+_ATTEMPT = re.compile(r"series_id\W{0,3}[:=]")  # a line that tried to be a verdict object
 _ID_AFTER_KEY = re.compile(r"""series_id\W*["']([^"']+)["']""")
 
 
@@ -43,13 +45,14 @@ class ParsedVerdict:
         return sid if isinstance(sid, str) else str(sid)
 
 
-def extract_json_values(text: str) -> list[Any]:
-    """Every JSON object or array embedded in ``text``, in order of appearance.
+def extract_json_values(text: str) -> list[tuple[Any, int, int]]:
+    """Every JSON object or array embedded in ``text``, with its character span.
 
     Scans for ``{`` / ``[`` and attempts a decode from each; a successful decode consumes
-    its span, so nested structures are returned once, at the outermost level.
+    its span, so nested structures are returned once, at the outermost level. Absurdly
+    deep nesting (a model stuck in a ``[[[[`` loop) is skipped like any other non-JSON.
     """
-    values: list[Any] = []
+    values: list[tuple[Any, int, int]] = []
     pos = 0
     n = len(text)
     while pos < n:
@@ -58,24 +61,27 @@ def extract_json_values(text: str) -> list[Any]:
             continue
         try:
             value, end = _DECODER.raw_decode(text, pos)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             pos += 1
             continue
-        values.append(value)
+        values.append((value, pos, end))
         pos = end
     return values
 
 
-def _candidates(values: Iterable[Any]) -> list[dict[str, Any]]:
+def _candidates(value: Any, depth: int = 0) -> list[dict[str, Any]]:
+    if depth > 32:
+        return []
     out: list[dict[str, Any]] = []
-    for v in values:
-        if isinstance(v, dict):
-            if "series_id" in v:
-                out.append(v)
-            else:
-                out.extend(_candidates(v.values()))
-        elif isinstance(v, list):
-            out.extend(_candidates(v))
+    if isinstance(value, dict):
+        if "series_id" in value:
+            out.append(value)
+        else:
+            for v in value.values():
+                out.extend(_candidates(v, depth + 1))
+    elif isinstance(value, list):
+        for v in value:
+            out.extend(_candidates(v, depth + 1))
     return out
 
 
@@ -103,7 +109,7 @@ def _normalise(raw: dict[str, Any]) -> tuple[VerdictRecord | None, str | None, t
     if extra:
         notes.append(f"ignored extra field(s) {extra}")
     try:
-        record = VerdictRecord(series_id=sid.strip(), verdict=verdict, explanation=explanation)
+        record = VerdictRecord(series_id=sid, verdict=verdict, explanation=explanation)
     except ValidationError as exc:
         return None, exc.errors()[0]["msg"], tuple(notes)
     return record, None, tuple(notes)
@@ -113,18 +119,24 @@ def parse_verdicts(text: str) -> list[ParsedVerdict]:
     """All verdict candidates in ``text``.
 
     Candidates are JSON objects carrying a ``series_id`` key (anywhere in the text, at any
-    nesting depth), plus any line that mentions ``series_id`` without belonging to a
-    decodable object - a broken attempt, reported so the trace can count it.
+    nesting depth), plus any line outside every decoded value that still looks like an
+    attempt at one (``series_id`` followed by a colon) - a broken object, reported so the
+    trace can count it.
     """
     parsed: list[ParsedVerdict] = []
-    for raw in _candidates(extract_json_values(text)):
-        record, error, notes = _normalise(raw)
-        parsed.append(ParsedVerdict(raw=raw, record=record, error=error, notes=notes))
-    decoded_ids = [p.raw.get("series_id") for p in parsed]
-    for line in text.splitlines():
-        if "series_id" not in line:
+    spans: list[tuple[int, int]] = []
+    for value, start, end in extract_json_values(text):
+        spans.append((start, end))
+        for raw in _candidates(value):
+            record, error, notes = _normalise(raw)
+            parsed.append(ParsedVerdict(raw=raw, record=record, error=error, notes=notes))
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        start, end = offset, offset + len(line)
+        offset = end
+        if not _ATTEMPT.search(line):
             continue
-        if any(isinstance(sid, str) and sid and sid in line for sid in decoded_ids):
+        if any(a < end and start < b for a, b in spans):
             continue
         parsed.append(
             ParsedVerdict(
@@ -150,11 +162,19 @@ class IngestResult:
     accepted: list[VerdictRecord] = field(default_factory=list)
     rejected: list[tuple[ParsedVerdict, str]] = field(default_factory=list)
     superseded: list[str] = field(default_factory=list)
+    restated: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
 
 
+Resolver = Callable[[str], "str | None"]
+
+
 class VerdictCollector:
-    """Episode-level verdict state: which series were examined, which verdict stands."""
+    """Episode-level verdict state: which series were examined, which verdict stands.
+
+    Ids are resolved through ``resolve`` (the id view of the episode: plain or aliased);
+    without one, an exact match against ``known_ids`` and then a whitespace-trimmed one.
+    """
 
     def __init__(self) -> None:
         self.examined: OrderedDict[str, int] = OrderedDict()
@@ -174,7 +194,7 @@ class VerdictCollector:
         """Examined series without a standing verdict, in examination order."""
         return [sid for sid in self.examined if sid not in self.final]
 
-    def ingest(self, text: str, request_index: int, known_ids: Collection[str]) -> IngestResult:
+    def ingest(self, text: str, request_index: int, known_ids: Collection[str], *, resolve: Resolver | None = None) -> IngestResult:
         """Parse ``text`` and apply the episode rules. Idempotent per ``request_index``."""
         result = IngestResult()
         if request_index in self._ingested_requests:
@@ -183,42 +203,78 @@ class VerdictCollector:
         self.results[request_index] = result
         if not text:
             return result
-        for cand in parse_verdicts(text):
-            sid = cand.series_id
+        resolver = resolve or _plain_resolver(known_ids)
+        try:
+            candidates = parse_verdicts(text)
+        except Exception as exc:  # a degenerate reply must not end the episode
+            self.n_rejected += 1
+            result.rejected.append((ParsedVerdict(raw={"series_id": "?"}, record=None, error=type(exc).__name__), f"parse_error: {type(exc).__name__}"))
+            result.events.append(_event(request_index, "?", "?", 0, False, False, f"parse_error: {type(exc).__name__}", False, []))
+            return result
+        for cand in candidates:
+            raw_sid = cand.series_id
+            real = resolver(raw_sid)
+            notes = list(cand.notes)
+            if real is not None and real != raw_sid:
+                notes.append(f"series_id resolved from {raw_sid!r}")
+            sid = real if real is not None else raw_sid
             examined = sid in self.examined
             reason: str | None = None
             if cand.record is None:
                 reason = f"invalid_record: {cand.error}"
-            elif sid not in known_ids:
+            elif real is None:
                 reason = "unknown_series_id"
             elif not examined:
                 reason = "not_examined"
             supersedes = False
+            explanation_chars = 0
             if reason is None:
                 assert cand.record is not None
-                supersedes = sid in self.final
-                if supersedes:
+                record = VerdictRecord(series_id=sid, verdict=cand.record.verdict, explanation=cand.record.explanation)
+                explanation_chars = len(record.explanation or "")
+                standing = self.final.get(sid)
+                if standing is not None and standing == record:
+                    notes.append("restates the standing verdict")
+                    result.restated.append(sid)
+                elif standing is not None:
+                    supersedes = True
                     self.revisions[sid] += 1
                     result.superseded.append(sid)
-                self.final[sid] = cand.record
-                result.accepted.append(cand.record)
+                self.final[sid] = record
+                result.accepted.append(record)
             else:
                 self.n_rejected += 1
                 result.rejected.append((cand, reason))
-            explanation = cand.raw.get("explanation")
+                explanation = cand.raw.get("explanation")
+                explanation_chars = len(explanation) if isinstance(explanation, str) else 0
             result.events.append(
-                {
-                    "request_index": request_index,
-                    "series_id": sid,
-                    "verdict": str(cand.raw.get("verdict")),
-                    "explanation_chars": len(explanation) if isinstance(explanation, str) else 0,
-                    "examined": examined,
-                    "accepted": reason is None,
-                    "reason": reason,
-                    "supersedes": supersedes,
-                }
+                _event(request_index, sid, str(cand.raw.get("verdict")), explanation_chars, examined, reason is None, reason, supersedes, notes)
             )
         return result
 
     def records(self) -> list[VerdictRecord]:
         return list(self.final.values())
+
+
+def _plain_resolver(known_ids: Collection[str]) -> Resolver:
+    def resolve(model_id: str) -> str | None:
+        if model_id in known_ids:
+            return model_id
+        trimmed = model_id.strip()
+        return trimmed if trimmed in known_ids else None
+
+    return resolve
+
+
+def _event(request_index: int, series_id: str, verdict: str, explanation_chars: int, examined: bool, accepted: bool, reason: str | None, supersedes: bool, notes: list[str]) -> dict[str, Any]:
+    return {
+        "request_index": request_index,
+        "series_id": series_id,
+        "verdict": verdict,
+        "explanation_chars": explanation_chars,
+        "examined": examined,
+        "accepted": accepted,
+        "reason": reason,
+        "supersedes": supersedes,
+        "notes": list(notes),
+    }

@@ -12,6 +12,10 @@ Two files are written per episode:
     verdict as it was parsed, accepted or not), ``series`` (per-series roll-up: call count,
     timing, attributed token usage) and ``run_end`` (totals and how the episode ended).
 
+The models validate strictly - ``"3"`` is not ``3`` and ``1`` is not ``True`` - and carry no
+defaults for the counted fields, so a file that passes :func:`validate_trace_file` really
+does hold every field the acceptance criteria name, with the right type.
+
 Timing fields hold wall-clock measurements and therefore differ between otherwise
 identical runs; :data:`TIMING_FIELDS` names them so a determinism check can skip them.
 """
@@ -29,7 +33,7 @@ VERDICT_VALUES: tuple[str, ...] = ("anomalous", "normal")
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 # --- anomaly_verdicts.jsonl -------------------------------------------------------------
@@ -61,12 +65,16 @@ class VerdictRecord(_Strict):
 class UsageFields(_Strict):
     """Token usage as reported by the provider (integers, exact)."""
 
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
-    details: dict[str, int] = Field(default_factory=dict)
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    details: dict[str, int]
+
+
+def zero_usage() -> UsageFields:
+    return UsageFields(input_tokens=0, output_tokens=0, total_tokens=0, cache_read_tokens=0, cache_write_tokens=0, details={})
 
 
 class AttributedUsage(_Strict):
@@ -76,10 +84,14 @@ class AttributedUsage(_Strict):
     between them, so the per-series shares plus the overhead add up to the run totals.
     """
 
-    requests: float = 0.0
-    input_tokens: float = 0.0
-    output_tokens: float = 0.0
-    total_tokens: float = 0.0
+    requests: float
+    input_tokens: float
+    output_tokens: float
+    total_tokens: float
+
+
+def zero_attributed() -> AttributedUsage:
+    return AttributedUsage(requests=0.0, input_tokens=0.0, output_tokens=0.0, total_tokens=0.0)
 
 
 class PoolInfo(_Strict):
@@ -96,9 +108,14 @@ class ModelInfo(_Strict):
 
 
 class LimitsInfo(_Strict):
+    """The episode caps: pydantic-ai's (checked after the fact) and the harness's projection."""
+
     request_limit: int | None
     tool_calls_limit: int | None
     total_tokens_limit: int | None
+    context_tokens_limit: int | None
+    chars_per_token_estimate: float
+    output_allowance_tokens: int
 
 
 class PromptInfo(_Strict):
@@ -116,6 +133,8 @@ class RunStartRecord(_Strict):
     run_id: str
     config_fingerprint: str
     pool: PoolInfo
+    order_seed: int | None
+    series_id_aliasing: bool
     model: ModelInfo
     usage_limits: LimitsInfo
     retries: RetriesInfo
@@ -127,7 +146,8 @@ class RunStartRecord(_Strict):
 
 
 class ToolCallRecord(_Strict):
-    """One tool invocation, in execution order."""
+    """One tool invocation, in execution order. ``args`` is what the model sent; ``series_id``
+    is the pool id it resolved to (or the raw string when it did not resolve)."""
 
     kind: Literal["tool_call"] = "tool_call"
     call_index: int
@@ -144,12 +164,16 @@ class ToolCallRecord(_Strict):
     duration_ms: float
 
 
+RetryKind = Literal["tool", "output"]
+
+
 class ModelRequestRecord(_Strict):
     """One LLM request/response round trip."""
 
     kind: Literal["model_request"] = "model_request"
     request_index: int
     is_retry: bool
+    retry_kind: RetryKind | None
     started_at: str
     duration_ms: float
     usage: UsageFields
@@ -178,6 +202,7 @@ class VerdictEvent(_Strict):
     accepted: bool
     reason: str | None
     supersedes: bool
+    notes: list[str]
 
 
 class SeriesRecord(_Strict):
@@ -197,7 +222,7 @@ class SeriesRecord(_Strict):
     attributed_usage: AttributedUsage
 
 
-TerminationReason = Literal["completed", "usage_limit", "model_error", "protocol_error", "interrupted"]
+TerminationReason = Literal["completed", "budget", "usage_limit", "model_error", "protocol_error", "interrupted"]
 
 
 class Termination(_Strict):
@@ -206,9 +231,9 @@ class Termination(_Strict):
 
 
 class ToolCallCounts(_Strict):
-    get_series: int = 0
-    get_pool_meta_data: int = 0
-    failed: int = 0
+    get_series: int
+    get_pool_meta_data: int
+    failed: int
 
 
 class SeriesCounts(_Strict):
@@ -226,13 +251,18 @@ class VerdictCounts(_Strict):
     revised: int
 
 
+class RetryCounts(_Strict):
+    tool: int
+    output: int
+
+
 class RunEndRecord(_Strict):
     kind: Literal["run_end"] = "run_end"
     finished_at: str
     duration_ms: float
     termination: Termination
     requests: int
-    retries: int
+    retries: RetryCounts
     tool_calls: ToolCallCounts
     usage: UsageFields
     overhead_usage: AttributedUsage

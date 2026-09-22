@@ -5,8 +5,9 @@ A pool is a spec-01 parquet file with the flattened columns ``series_id``, ``tim
 The ``label`` column is never read - not dropped after loading, never loaded - so nothing
 in this package can hand ground truth to the agent by accident.
 
-Series keep the order in which they first appear in the file, which is what
-``get_pool_meta_data`` reports and what makes a run replayable.
+Series keep the order in which they first appear in the file; :meth:`Pool.reordered`
+gives a seeded permutation of that order for runs that should not walk the file from the
+top (spec-01 files are grouped by source, see the task README).
 """
 
 from __future__ import annotations
@@ -69,6 +70,9 @@ class Pool:
 
     def __init__(self, name: str, series: Sequence[SeriesData], *, source: str | None = None):
         ids = [s.series_id for s in series]
+        for sid in ids:
+            if not sid or sid != sid.strip():
+                raise ValueError(f"pool {name!r}: empty or whitespace-padded series_id {sid!r}")
         if len(set(ids)) != len(ids):
             dupes = sorted({i for i in ids if ids.count(i) > 1})
             raise ValueError(f"duplicate series_id in pool {name!r}: {dupes[:5]}")
@@ -84,8 +88,10 @@ class Pool:
         """Build a pool from a flattened frame with the spec-01 columns.
 
         Any column beyond ``series_id`` / ``time_index`` / ``value`` (``label`` included)
-        is ignored. Rows of one series keep their file order; a series whose rows are not
-        in index order is reported as malformed by :meth:`SeriesData.problems`.
+        is ignored. Values must be ``float64`` (the spec-01 dtype) or an integer type,
+        which is kept: a narrower float would be widened into digits the file never held.
+        Rows of one series keep their file order; a series whose rows are not in index
+        order is reported as malformed by :meth:`SeriesData.problems`.
         """
         missing = [c for c in REQUIRED_COLUMNS if c not in frame.columns]
         if missing:
@@ -94,8 +100,16 @@ class Pool:
             raise ValueError(f"pool {name!r} is empty")
         if not pd.api.types.is_integer_dtype(frame["time_index"]):
             raise ValueError(f"pool {name!r}: time_index must be an integer column, got {frame['time_index'].dtype}")
-        if not pd.api.types.is_numeric_dtype(frame["value"]):
-            raise ValueError(f"pool {name!r}: value must be a numeric column, got {frame['value'].dtype}")
+        values_col = frame["value"]
+        if pd.api.types.is_integer_dtype(values_col):
+            value = values_col.to_numpy(dtype=np.int64)
+        elif values_col.dtype == np.float64:
+            value = values_col.to_numpy(dtype=np.float64)
+        else:
+            raise ValueError(
+                f"pool {name!r}: value must be a float64 or integer column, got {values_col.dtype}; "
+                "cast it explicitly rather than let the loader widen it"
+            )
         ids = frame["series_id"].to_numpy()
         if pd.isna(ids).any():
             raise ValueError(f"pool {name!r}: series_id contains missing values")
@@ -107,7 +121,7 @@ class Pool:
         starts = np.concatenate(([0], bounds))
         stops = np.concatenate((bounds, [len(codes)]))
         time_index = frame["time_index"].to_numpy(dtype=np.int64)[order]
-        value = frame["value"].to_numpy(dtype=np.float64)[order]
+        value = value[order]
         series = [
             SeriesData(str(uniques[k]), time_index[a:b].copy(), value[a:b].copy())
             for k, (a, b) in enumerate(zip(starts, stops))
@@ -167,16 +181,24 @@ class Pool:
         series = [self._series[i] for i in self._order if i in keep]
         return Pool(self._name, series, source=self._source)
 
+    def reordered(self, seed: int | None) -> "Pool":
+        """The same series in a seeded random order; ``None`` keeps the file order."""
+        if seed is None:
+            return self
+        perm = np.random.default_rng(seed).permutation(len(self._order))
+        return Pool(self._name, [self._series[self._order[i]] for i in perm], source=self._source)
+
     @cached_property
     def fingerprint(self) -> str:
-        """SHA-256 over ids, indices and values in pool order - identifies the exact input."""
+        """SHA-256 over ids, indices, values and their dtype, in pool order - identifies the exact input."""
         h = hashlib.sha256()
         for sid in self._order:
             s = self._series[sid]
             h.update(sid.encode("utf-8"))
             h.update(b"\0")
             h.update(np.ascontiguousarray(s.time_index, dtype="<i8").tobytes())
-            h.update(np.ascontiguousarray(s.value, dtype="<f8").tobytes())
+            h.update(str(s.value.dtype).encode("ascii"))
+            h.update(np.ascontiguousarray(s.value, dtype=s.value.dtype.newbyteorder("<")).tobytes())
             h.update(b"\n")
         return h.hexdigest()
 

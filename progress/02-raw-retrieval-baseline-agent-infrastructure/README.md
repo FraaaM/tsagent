@@ -19,8 +19,8 @@ how to run it and what to expect from it.
       [`tools.py`](../../code/src/baseline_agent/tools.py). The `label` column is never
       read; unknown or malformed ids come back as an error sentence, not an exception.
 - [x] The agent (FR3, spec §4.2): two function tools and nothing else, plain-text output,
-      greedy decoding, an efficiency-focused system prompt with the stop-when-confident
-      rule - [`agent.py`](../../code/src/baseline_agent/agent.py),
+      greedy decoding, one tool call at a time, the B1 budget prompt with the
+      stop-when-confident rule - [`agent.py`](../../code/src/baseline_agent/agent.py),
       [`prompt.py`](../../code/src/baseline_agent/prompt.py).
 - [x] One episode per pool with the agent choosing what to examine (FR4), the verdict
       protocol and writer (FR5), the decision trace with per-call timing and per-request
@@ -29,13 +29,15 @@ how to run it and what to expect from it.
       [`verdicts.py`](../../code/src/baseline_agent/verdicts.py),
       [`trace.py`](../../code/src/baseline_agent/trace.py),
       [`writers.py`](../../code/src/baseline_agent/writers.py).
-- [x] Entry point [`run_baseline_agent.py`](../../code/src/run_baseline_agent.py) and the
-      replay comparison behind FR7 (`REPLAYS > 1`).
-- [x] Unit tests, no LLM and no GPU (spec §3, unit level): tool registration, tool
-      behaviour, output schemas, and whole episodes driven by a scripted stand-in model,
-      including every termination path - [`code/tests/`](../../code/tests/), 59 tests.
+- [x] Entry point [`run_baseline_agent.py`](../../code/src/run_baseline_agent.py) with
+      output validation and the replay comparison behind FR7 (`REPLAYS > 1`).
+- [x] Unit tests, no LLM and no GPU (spec §3, unit level): tool registration and the
+      settings the model receives, tool behaviour, strict output schemas, and whole episodes
+      driven by a scripted stand-in model through every termination path -
+      [`code/tests/`](../../code/tests/), 92 tests.
 - [x] Dry runs on the real R1 pool with the stand-in: pipeline, trace consistency and
-      replay identity hold on real data.
+      replay identity hold on real data; [`src/measure_payloads.py`](src/measure_payloads.py)
+      reproduces the context arithmetic below.
 - [ ] End-to-end runs with an LLM (spec §3, E2E level): a replay pair for FR7 and a full
       run over R1 or R2 within the token budget. Blocked on an API endpoint or a local
       model server; nothing in the harness needs to change to do them, see
@@ -46,18 +48,21 @@ how to run it and what to expect from it.
 
 ```
 code/src/baseline_agent/
-  pool.py        Pool: label-free view of a spec-01 parquet file, series in file order
+  pool.py        Pool: label-free view of a spec-01 parquet file, seeded reordering
   tools.py       get_series / get_pool_meta_data as pure functions returning text
-  prompt.py      system prompt (budget instruction, verdict format, stop rule), user prompt
+  ids.py         the ids the model sees: the pool's own, or opaque aliases (off by default)
+  prompt.py      system prompt (task, verdict format, budget rule, stop rule), user prompt
   agent.py       pydantic-ai Agent: the two tools with timing/trace wrappers, output check
   verdicts.py    verdict-line parser and the episode rules (examined-only, last wins)
   trace.py       decision-trace recorder, per-series roll-ups, token attribution
   writers.py     JSONL writers (verdicts file keeps one record per series)
-  runner.py      run_episode: agent.iter() loop, termination handling, compare_runs (FR7)
+  runner.py      run_episode: agent.iter() loop, budget projection, termination handling,
+                 compare_runs (FR7)
   models.py      model string -> pydantic-ai Model (providers, OpenAI-compatible endpoints)
   scripted.py    deterministic stand-in for the LLM - dry runs and tests only
 code/src/run_baseline_agent.py   configuration-driven entry point
 code/tests/                      test_tools.py, test_output_schemas.py, test_runner.py
+src/measure_payloads.py          payload and token measurements behind the table below
 (runs land in ../../data/02-raw-retrieval-baseline-agent-infrastructure/runs/, git-ignored)
 ```
 
@@ -79,18 +84,23 @@ python code/src/run_baseline_agent.py
 ```
 
 The defaults make a **dry run**: `MODEL = "scripted"` replaces the LLM with a
-deterministic stand-in that walks the first 25 series of R1 in pool order, retrieves each
-once, judges it with a fixed rule and stops. It exercises everything except the model and
-needs no API. Its verdicts say nothing about anomaly detection.
+deterministic stand-in that walks the served order of R1, retrieves each series once,
+judges it with a fixed rule and moves on, until the budget projection stops the episode
+(11 series with the default 1M-token cap; its token counts are estimates, see below). It
+exercises everything except the model and needs no API. Its verdicts say nothing about
+anomaly detection.
 
 Useful knobs:
 
 | Knob | Meaning |
 |------|---------|
-| `POOL_FILE`, `SPLIT`, `SERIES_LIMIT` | which pool, optionally one split (`dev`/`test`) or the first N series |
+| `POOL_FILE`, `SPLIT`, `SERIES_LIMIT` | which pool, optionally one split (`dev`/`test`) or the first N series of the served order |
+| `ORDER_SEED` | seeded permutation of the order the agent is shown (`None` = file order) |
+| `ALIAS_SERIES_IDS` | show the agent opaque ids instead of the provenance-carrying spec-01 ids (off by default) |
 | `MODEL`, `MODEL_BASE_URL`, `MODEL_API_KEY_ENV` | which LLM, and where (see below) |
-| `TEMPERATURE = 0.0`, `SEED = 42` | greedy, seeded decoding (FR7) |
-| `REQUEST_LIMIT`, `TOOL_CALLS_LIMIT`, `TOTAL_TOKENS_LIMIT` | the episode caps; the token cap defaults to the constitution's 1M |
+| `TEMPERATURE = 0.0`, `SEED = 42`, `PARALLEL_TOOL_CALLS = False` | greedy, seeded decoding, one retrieval per turn (FR7, idea B) |
+| `REQUEST_LIMIT`, `TOOL_CALLS_LIMIT` | pydantic-ai's episode caps; both default to 2 per series + 8 |
+| `TOTAL_TOKENS_LIMIT`, `CONTEXT_TOKENS_LIMIT` | the token budget (default: the constitution's 1M) and the model's window; the harness stops *before* the request that would break either |
 | `OUTPUT_RETRIES`, `ENFORCE_VERDICTS` | the missing-verdict nudge (see design decisions) |
 | `REPLAYS` | `2` runs the episode twice and reports whether the outputs are identical |
 
@@ -103,17 +113,9 @@ python -m pytest
 
 ### Running with a real model
 
-`MODEL` takes any pydantic-ai model string; credentials come from the provider's usual
-environment variable:
-
-```python
-MODEL = "anthropic:claude-sonnet-4-5"      # ANTHROPIC_API_KEY
-MODEL = "openai:gpt-4.1-mini"              # OPENAI_API_KEY
-MODEL = "openrouter:openai/gpt-oss-20b"    # OPENROUTER_API_KEY
-```
-
-A local model on the project GPU is served through an OpenAI-compatible endpoint
-(vLLM, Ollama, LM Studio, llama.cpp all speak it):
+The constitution caps the LLM at about 20B parameters, so the intended targets are open
+models served locally on the project GPU or hosted. A local server (vLLM, Ollama,
+LM Studio, llama.cpp - all speak the OpenAI chat protocol):
 
 ```python
 MODEL = "openai-chat:gpt-oss-20b"
@@ -121,19 +123,31 @@ MODEL_BASE_URL = "http://localhost:8000/v1"
 MODEL_API_KEY_ENV = "OPENAI_API_KEY"       # whatever the server expects, or unset
 ```
 
+Hosted or provider-native strings work the same way, with credentials in the provider's
+usual environment variable:
+
+```python
+MODEL = "ollama:qwen3:14b"                 # OLLAMA_BASE_URL if not local
+MODEL = "openrouter:openai/gpt-oss-20b"    # OPENROUTER_API_KEY
+MODEL = "anthropic:claude-sonnet-4-5"      # ANTHROPIC_API_KEY - harness checks only, out of the 20B constraint
+```
+
 Provider-specific settings go into `EXTRA_MODEL_SETTINGS` (for example
 `{"openai_reasoning_effort": "low"}`). `SEED` is honoured by OpenAI-style chat endpoints
 and vLLM and ignored by providers that do not expose one; pydantic-ai drops `temperature`
-for the newest Claude models, which do not accept it. With `REPLAYS = 2` the script says
-whether the two episodes agree, so the determinism a given endpoint actually delivers is
-measured rather than assumed - hosted APIs do not promise bit-exact greedy decoding.
+for the newest Claude models, which do not accept it. `CONTEXT_TOKENS_LIMIT` should be set
+to the served model's window so the episode ends with a recorded `budget` stop instead of
+a provider error. With `REPLAYS = 2` the script says whether the two episodes agree, so the
+determinism a given endpoint actually delivers is measured rather than assumed - hosted
+APIs do not promise bit-exact greedy decoding.
 
 ## Outputs
 
 One directory per run, `OUTPUT_DIR / RUN_NAME` (default
 `<pool>[_<split>][_first<N>]__<model slug>`, replays get a `__replay<k>` suffix):
 
-**`anomaly_verdicts.jsonl`** (FR5) - one record per examined series, its standing verdict:
+**`anomaly_verdicts.jsonl`** (FR5) - one record per examined series, its standing verdict,
+always in the pool's own ids:
 
 ```json
 {"series_id": "R1__YAHOO__real_42_full", "verdict": "normal"}
@@ -146,27 +160,35 @@ One directory per run, `OUTPUT_DIR / RUN_NAME` (default
 
 | `kind` | One per | Carries |
 |--------|---------|---------|
-| `run_start` | run | run id, pool (name, path, size, fingerprint), model and settings, limits, prompt hash, registered tools, harness versions |
-| `model_request` | LLM round trip | index, retry flag, wall time, provider usage (input / output / cache tokens), context size in characters, tool calls requested, verdicts accepted / rejected |
-| `tool_call` | tool invocation | tool, arguments, series id, ok or error text, points returned, payload size, wall time |
-| `verdict` | parsed verdict | series id, verdict, whether the series was examined, accepted or the rejection reason, whether it superseded an earlier one |
+| `run_start` | run | run id, pool (name, path, size, fingerprint), order seed, aliasing flag, model and settings, caps, prompt hash, registered tools, harness versions |
+| `model_request` | LLM round trip | index, retry kind (`tool` / `output` / none), wall time, provider usage (input / output / cache tokens, details), context size in characters, tool calls requested, verdicts accepted / rejected |
+| `tool_call` | tool invocation | tool, arguments as sent, resolved series id, ok or error text, points returned, payload size, wall time |
+| `verdict` | parsed verdict | series id, verdict, whether the series was examined, accepted or the rejection reason, whether it superseded an earlier one, normalisation notes |
 | `series` | series touched | `get_series` call count (and failures), tool time, first / last request, standing verdict, revisions, attributed token usage |
-| `run_end` | run | termination reason, totals (requests, retries, tool calls, tokens), overhead usage, coverage counts, verdict counts |
+| `run_end` | run | termination reason, totals (requests, retries by kind, tool calls, tokens), overhead usage, coverage counts, verdict counts |
 
-`termination.reason` is one of `completed` (the agent stopped by itself), `usage_limit`
-(a cap tripped), `model_error` (the provider failed, e.g. context overflow),
-`protocol_error` (the agent kept ending without verdicts for examined series) or
-`interrupted`. Whatever the reason, the trace is closed by `run_end` and the verdicts
-file holds every verdict accepted up to that point.
+`termination.reason` is one of `completed` (the agent replied without a tool call),
+`budget` (the harness projected that the next request would break `TOTAL_TOKENS_LIMIT` or
+`CONTEXT_TOKENS_LIMIT` and stopped before fetching), `usage_limit` (a pydantic-ai cap
+tripped after a response: request, tool-call or token count), `model_error` (the provider
+failed), `protocol_error` (pydantic-ai gave up on the model's output: output retries
+exhausted by the missing-verdict check, tool-argument retries exhausted, or a response
+truncated before it produced anything) or `interrupted` (Ctrl-C or task cancellation).
+Whatever the reason, the trace is closed by `run_end` and the verdicts file holds every
+verdict accepted up to that point. `run_end.retries` counts retry prompts by kind: `output`
+for the missing-verdict nudge, `tool` for invalid tool arguments and unknown tool names.
 
-**`messages.json`** - the whole conversation as pydantic-ai recorded it, tool payloads
-included: the ground truth for anything about context. **`summary.json`** - the
-`run_end` record plus identifiers, for quick reading.
+**`messages.json`** - the conversation as pydantic-ai kept it, tool payloads included: the
+ground truth for anything about context. **`summary.json`** - the `run_end` record plus
+identifiers. **`series_aliases.json`** - alias to pool id, only when aliasing is on.
 
 `baseline_agent.schemas.validate_verdicts_file` / `validate_trace_file` validate the two
-files; `baseline_agent.runner.compare_runs` compares two run directories field for field,
-ignoring wall-clock fields (`started_at`, `finished_at`, `duration_ms`, `tool_time_ms`)
-and provider-generated ids.
+files strictly (types are checked, not coerced; the entry point runs both after every
+episode). `baseline_agent.runner.compare_runs` compares two run directories field for
+field, setting aside wall-clock fields (`started_at`, `finished_at`, `duration_ms`,
+`tool_time_ms`), provider-generated ids, and the provider's cache accounting
+(`cache_read_tokens`, `cache_write_tokens`, usage `details`), which a warm prompt cache
+changes without changing what the model saw or said.
 
 ## Design decisions worth knowing
 
@@ -176,93 +198,141 @@ tool exposed to the model and would end the run on first use, so the agent write
 verdict as a one-line JSON object in its reply and the harness parses every response the
 moment it arrives. The parser is lenient about placement (bare lines, code fences,
 pretty-printed objects, arrays, prose around them) and strict about content, which is the
-`VerdictRecord` schema. Episode rules on top: a verdict counts only for a series whose
-values the agent retrieved in this episode, unknown ids are discarded, the last verdict for
-a series wins. Every accepted, revised or discarded verdict is a `verdict` record in the
-trace, so hallucinated ids and blind verdicts are measured instead of silently dropped.
+`VerdictRecord` schema; a line that tried to be a verdict object and failed is counted as
+malformed, prose that merely mentions `series_id` is not. Episode rules on top: a verdict
+counts only for a series whose values the agent retrieved in this episode, unknown ids are
+discarded, the last verdict for a series wins, and restating a verdict changes nothing.
+Every accepted, revised or discarded verdict is a `verdict` record in the trace, so
+hallucinated ids and blind verdicts are measured instead of silently dropped.
 
 **One protocol check, no coverage push.** If the agent ends the episode while a series it
 retrieved has no verdict, the output validator answers with a `ModelRetry` naming the
-series (bounded by `OUTPUT_RETRIES`, counted in `run_end.retries`). That is the FR4
+series (bounded by `OUTPUT_RETRIES`, counted in `run_end.retries.output`). That is the FR4
 protocol - a verdict for each examined series - and nothing more: the harness never asks
 the agent to examine another series, never re-fetches, never compacts the history.
 Stopping early is the baseline's own property and stays visible as
 `series.examined` / `series.in_pool`. `ENFORCE_VERDICTS = False` switches even that check
 off.
 
-**Label-free by construction.** `Pool.from_parquet` reads `series_id`, `time_index`,
-`value` and nothing else; the metadata file is opened only to select a split, and only its
-`series_id` / `split` columns. The prompt names no base rate. A test checks that neither
-tool payload can carry a label.
+**One tool call at a time.** pydantic-ai runs tool calls of one response in parallel
+threads by default, which makes the order of trace records - and the order in which
+series count as examined - depend on thread timing whenever a model batches several
+`get_series` calls into one turn. The tools are registered as sequential and the runner
+pins sequential execution, so calls run in the order the model issued them;
+`PARALLEL_TOOL_CALLS = False` additionally asks providers that support it for one call per
+turn, which is idea B's turn-by-turn traversal (idea C, batched retrieval, was rejected by
+the spec). A test batches five calls and checks three replays agree.
+
+**The budget is enforced before the expensive request, not after it.** pydantic-ai checks
+`total_tokens_limit` only once a response has been received and paid for, and in this
+loop the request after a retrieval is the one that carries the new payload - so a cap that
+trips there both overshoots the budget by a full context and discards the response that
+held the verdict for the series just retrieved. After every response that asks for tools,
+the runner projects the next request from the provider's own count of the current context,
+the size of the requested payloads and a reply allowance, and ends the episode with reason
+`budget` *before* fetching when the projection breaks `TOTAL_TOKENS_LIMIT` or
+`CONTEXT_TOKENS_LIMIT`. The requested-but-unfetched ids are named in the termination
+detail; no series is left retrieved and unjudged by the harness. pydantic-ai's own caps
+stay on as the backstop, and if one of them does trip after a response, the response is
+still booked exactly: the model is wrapped so the harness keeps what pydantic-ai drops.
+
+**Label-free by construction, provenance by choice.** `Pool.from_parquet` reads
+`series_id`, `time_index`, `value` and nothing else; the metadata file is opened only to
+select a split, and only its `series_id` / `split` columns; the prompt names no base rate,
+pool size or series length. What the tools do expose is the spec-01 id itself, and on R1
+its provenance predicts the label: YAHOO samples are 95% anomalous, NEK 100%, unsplit
+`_full` samples 96% against 23% for chunks (R2 is milder: 20-36% by source). An agent
+could therefore guess from the id without reading a value. `ALIAS_SERIES_IDS = True`
+replaces ids with opaque `s0001`-style names in both tools and in the retry message, maps
+them back for every output file and trace field, writes the mapping next to the outputs,
+and - as a side effect - cuts the `get_pool_meta_data` payload about five-fold. It is off
+by default because spec 02 defines the tools in terms of the pool's ids; turning it on is
+a decision for the RQ1 protocol, and whichever way it goes the tool-augmented agent must
+be served the same ids.
+
+**Served order is a seed, not the file order.** Spec-01 files are grouped by source, so
+file order walks one recording at a time: the first 25 R1 series are consecutive Exathlon
+chunks with a 4% anomaly rate, and the positive rate climbs from 9% in the first decile of
+the file to 45% in the last. With a budget that covers a dozen series, an agent working
+down the list would judge an unrepresentative slice. `ORDER_SEED` (42 in the entry point)
+serves a seeded permutation, recorded in `run_start` and in the run id; `SERIES_LIMIT`
+applies to the served order, so a "first N" is a seeded sample. `None` restores file order.
 
 **Tool results are text with a pinned wire format.** Both tools return the JSON string
-the model will see (compact, no whitespace, insertion-ordered keys) rather than a dict for
-pydantic-ai to serialise. That makes the payload size a fact (`payload_chars` in the
-trace), keeps replays byte-identical across providers, and is where FR1's "textual error
-message" lives: an unknown id or a broken series (NaN, non-contiguous index) yields
-`Error: ...` for the model to read, never an exception.
+the model will see (compact, no whitespace, insertion-ordered keys, integers kept as
+integers) rather than a dict for pydantic-ai to serialise. That makes the payload size a
+fact (`payload_chars` in the trace), keeps replays byte-identical across providers, and is
+where FR1's "textual error message" lives: an unknown id or a broken series (NaN,
+non-contiguous index) yields `Error: ...` for the model to read, never an exception.
 
 **Every ending is a recorded ending.** The runner steps through pydantic-ai's graph
 (`agent.iter`) so that each model request is timed and its usage booked as it happens,
-and verdicts and trace lines are flushed to disk immediately. A usage cap, a provider
-error, exhausted retries or Ctrl-C all end in a `run_end` record with the reason, and the
-files written so far are complete as far as they go. A cap that trips after a response was
-received is booked from the run's usage totals when pydantic-ai discards that response, so
-the trace never under-reports what the provider charged.
+and verdicts and trace lines are flushed to disk immediately. A budget stop, a usage cap,
+a provider error, exhausted retries or a cancellation all end in a `run_end` record with
+the reason, and every file is written. `history_chars` counts the system prompt once per
+request, as the provider receives it, not once per request kept in the history.
 
 **Token attribution.** Providers report usage per request, and one request can consume
 the payloads of several series. Each request is charged to the series whose `get_series`
-payloads it consumed (the successful calls executed right before it), split equally; the
-prompt-only first turn, the metadata turn, the final message and retries are booked as
-`overhead_usage`. Shares are fractional so that `series.attributed_usage` plus
-`run_end.overhead_usage` equal `run_end.usage` exactly - a test checks the sum.
+payloads it consumed (the successful calls executed right before it), split equally;
+requests that follow no retrieval - the prompt-only first turn, the metadata turn, retries,
+a closing message sent without a retrieval before it - are booked as `overhead_usage`.
+Shares are fractional so that `series.attributed_usage` plus `run_end.overhead_usage`
+equal `run_end.usage` exactly; a test checks the sum.
 
-**Determinism (FR7).** Fixed prompt, pool order as in the file, greedy decoding with a
-seed, no timestamps in anything the model sees, deterministic tool payloads. The run id is
-a hash of the pool contents and the configuration, so two replays of the same setup share
-it. What legitimately differs is wall-clock timing and provider-generated ids, and
-`compare_runs` sets exactly those aside. `messages.json` is compared too, so the check
-covers the whole conversation, not only the summaries.
+**Determinism (FR7).** Fixed prompt, seeded served order, greedy decoding with a seed,
+sequential tool execution, no timestamps in anything the model sees, deterministic tool
+payloads. The run id is a hash of the pool contents and the configuration, so two replays
+of the same setup share it. What legitimately differs is wall-clock timing,
+provider-generated ids and cache accounting, and `compare_runs` sets exactly those aside.
+`messages.json` is compared too, so the check covers the whole conversation.
 
-**No history compaction, no batching, no rounding.** The natural fix for the context
-arithmetic below - dropping old payloads, fetching several series per call, sending
-fewer digits - would each change what the baseline is; spec 02 rejects batching (idea C)
-and RQ3 is about tool outputs that avoid this cost in the first place. The harness keeps
-every payload in context verbatim. `VALUE_PRECISION` exists for experiments on the last
-point and is off by default.
+**No history compaction, no batching, no rounding.** The natural fixes for the context
+arithmetic below - dropping old payloads, fetching several series per call, sending fewer
+digits - would each change what the baseline is; spec 02 rejects batching (idea C) and RQ3
+is about tool outputs that avoid this cost in the first place. The harness keeps every
+payload in context verbatim. `VALUE_PRECISION` exists for experiments on the last point and
+is off by default.
 
 **The scripted stand-in is a model, not a method.** `MODEL = "scripted"` plugs a
 deterministic policy into pydantic-ai's `FunctionModel`: discover the pool, retrieve
-series in order, judge each with a robust-z / frozen-run rule, stop. It also has switches
+series in served order, judge each with a robust-z / frozen-run rule, stop. It has switches
 to misbehave on purpose (blind verdicts, unknown ids, malformed lines, never stopping,
-skipping a verdict) so the tests can cover the harness's answers. Its token counts are
-estimates (4 characters per token, optimistic for numeric JSON) and it is labelled
-`scripted` everywhere.
+skipping a verdict, quitting at once) so the tests can cover the harness's answers. Its
+token counts are estimates at 4 characters per token - optimistic for numeric JSON, which
+tokenises at under 2 - and it is labelled `scripted` everywhere.
 
 ## What to expect from a full run
 
-`get_series` returns the whole series, and in a single episode every request re-sends the
-whole history. Measured on the four pools (o200k tokenizer, the GPT-4o / gpt-oss family):
+`get_series` returns the whole series, `get_pool_meta_data` lists every id, and in a single
+episode every request re-sends the whole history. Measured on the four pools with the
+o200k tokenizer (the GPT-4o / gpt-oss family; `src/measure_payloads.py`):
 
-| Pool | Series | Points per series (median / max) | Payload per series, chars (median / max) | Chars per token | Tokens per series (median) | Whole pool retrieved once |
-|------|--------|----------------------------------|------------------------------------------|-----------------|----------------------------|---------------------------|
-| R1 | 2,900 | 1,500 / 12,960 | 24.5k / 231.6k | 1.73 | ~14.2k | ~55M tokens |
-| R2 | 2,900 | 1,536 / 1,696 | 15.7k / 18.4k | 1.57 | ~10.0k | ~29M tokens |
-| S1 | 2,000 | 2,519 / 4,000 | 59.1k / 97.4k | 2.23 | ~26.5k | ~53M tokens |
-| S2 | 2,000 | 2,526 / 3,999 | 59.3k / 97.6k | 2.22 | ~26.7k | ~53M tokens |
+| Pool | Series | Points / series (median / max) | `get_series` payload, chars (median / max) | Chars / token | Tokens / series (median) | `get_pool_meta_data` payload | Whole pool once | Series per episode (1M budget) | Series per request (128k window) |
+|------|--------|--------------------------------|--------------------------------------------|---------------|--------------------------|------------------------------|-----------------|--------------------------------|----------------------------------|
+| R1 | 2,900 | 1,500 / 12,960 | 24.5k / 231.6k | 1.73 | ~14.2k | 118.6k chars ~ 52.6k tokens | ~55M tokens | ~8 | ~5 |
+| R2 | 2,900 | 1,536 / 1,696 | 15.7k / 18.4k | 1.60 | ~9.8k | 89.8k chars ~ 37.9k tokens | ~29M tokens | ~10 | ~9 |
+| S1 | 2,000 | 2,519 / 4,000 | 59.1k / 97.4k | 2.20 | ~26.9k | 61.2k chars ~ 28.0k tokens | ~54M tokens | ~7 | ~3 |
+| S2 | 2,000 | 2,526 / 3,999 | 59.3k / 97.6k | 2.21 | ~26.8k | 76.0k chars ~ 31.3k tokens | ~54M tokens | ~6 | ~3 |
 
-Numeric JSON tokenizes at under two characters per token, and the synthetic pools carry
-full-precision `float64` values (about 23 characters per point, twice the real pools).
-After k series of R1 a request carries roughly 14k × k tokens and the episode has consumed
-roughly 14k × k(k+1)/2:
+Numeric JSON tokenises at under two characters per token, the synthetic pools carry
+full-precision `float64` values (about 23 characters per point, twice the real pools), and
+the id list of a 2,900-series pool is itself 40-50k tokens that every request repeats.
+After k series of R1 a request carries roughly 52.6k + 14.2k × k tokens and the episode
+has consumed roughly 52.6k × (k+1) + 14.2k × k(k+1)/2:
 
-- the constitution's budget of about 1M tokens is spent after ~11 R1 series (~14 on R2,
-  ~8 on S1/S2);
-- a 128k-token context window overflows after ~8 R1 series, and the largest R1 series
+- the constitution's budget of about 1M tokens is spent after ~8 R1 series (~10 on R2,
+  ~6-7 on S1/S2);
+- a 128k-token window holds the id list plus ~5 R1 series, and the largest R1 series
   alone (12,960 points, ~134k tokens) does not fit in it at all;
-- the dry run with the stand-in (4 characters per token, so optimistic) reached the 1M cap
-  after 20 R1 series and 21 requests, with the 20th series retrieved but not yet judged -
-  reported as `examined_without_verdict = 1`.
+- aliasing the ids shrinks the metadata payload to about 26k characters (~10k tokens)
+  and buys a few more series per episode.
+
+The dry run with the stand-in (4 characters per token, so optimistic) on R1 with
+`ORDER_SEED = 42` ended with reason `budget` after 13 requests: 11 series retrieved, all 11
+judged, 905,750 estimated tokens spent, the 12th retrieval refused because the projection
+reached 1.06M. With aliasing on it managed 14 series in 16 requests for 966,295. Both
+replay identically.
 
 So on this baseline "a full run over one real dataset" is a run that terminates cleanly
 with every examined series judged and the caps respected, not one that reaches every
