@@ -38,11 +38,13 @@ how to run it and what to expect from it.
 - [x] Dry runs on the real R1 pool with the stand-in: pipeline, trace consistency and
       replay identity hold on real data; [`src/measure_payloads.py`](src/measure_payloads.py)
       reproduces the context arithmetic below.
-- [ ] End-to-end runs with an LLM (spec §3, E2E level): a replay pair for FR7 and a full
-      run over R1 or R2 within the token budget. Blocked on an API endpoint or a local
-      model server; nothing in the harness needs to change to do them, see
-      [Running with a real model](#running-with-a-real-model) and
-      [What to expect from a full run](#what-to-expect-from-a-full-run).
+- [x] End-to-end runs with an LLM (spec §3, E2E level) on a free endpoint, gpt-oss-20b
+      through OVHcloud's anonymous tier: replay pairs and a full R1 run - see
+      [End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints). The
+      harness behaves as designed; the endpoint does not replay deterministically, and the
+      model examines one to three series per episode.
+- [ ] The same runs on a second endpoint (Z.AI's free GLM-4.7-Flash, key pending) and, once
+      the supervisor's key is available, on enough of R1/R2 to characterise coverage.
 
 ## Layout
 
@@ -63,7 +65,10 @@ code/src/baseline_agent/
 code/src/run_baseline_agent.py   configuration-driven entry point
 code/tests/                      test_tools.py, test_output_schemas.py, test_runner.py
 src/measure_payloads.py          payload and token measurements behind the table below
-(runs land in ../../data/02-raw-retrieval-baseline-agent-infrastructure/runs/, git-ignored)
+src/summarize_run.py             coverage, cost, termination and label read-out of runs
+results/<run>/                   verdicts, trace and summary of the real-model runs
+(full runs, messages.json included, land in
+ ../../data/02-raw-retrieval-baseline-agent-infrastructure/runs/, git-ignored)
 ```
 
 ## Running
@@ -253,9 +258,15 @@ the runner projects the next request from the provider's own count of the curren
 the size of the requested payloads and a reply allowance, and ends the episode with reason
 `budget` *before* fetching when the projection breaks `TOTAL_TOKENS_LIMIT` or
 `CONTEXT_TOKENS_LIMIT`. The requested-but-unfetched ids are named in the termination
-detail; no series is left retrieved and unjudged by the harness. pydantic-ai's own caps
-stay on as the backstop, and if one of them does trip after a response, the response is
-still booked exactly: the model is wrapped so the harness keeps what pydantic-ai drops.
+detail. If the model still owes verdicts for series it did retrieve at that point (some
+models fetch several series before judging any), it gets one closing turn: the pending
+call is answered with a not-executed error and the model is asked for those verdicts -
+the same examined-implies-judged rule the output validator applies when the model stops by
+itself, never a request to examine more. The closing turn is skipped when it would not
+fit the cap either, and everything about it is in the trace (`retry_kind = "closing"`, the
+unexecuted call as a failed `tool_call`, `run_end.retries.closing`). pydantic-ai's own
+caps stay on as the backstop, and if one of them does trip after a response, the response
+is still booked exactly: the model is wrapped so the harness keeps what pydantic-ai drops.
 
 **Label-free by construction, provenance by choice.** `Pool.from_parquet` reads
 `series_id`, `time_index`, `value` and nothing else; the metadata file is opened only to
@@ -322,6 +333,70 @@ to misbehave on purpose (blind verdicts, unknown ids, malformed lines, never sto
 skipping a verdict, quitting at once) so the tests can cover the harness's answers. Its
 token counts are estimates at 4 characters per token - optimistic for numeric JSON, which
 tokenises at under 2 - and it is labelled `scripted` everywhere.
+
+## End-to-end runs on free endpoints
+
+The E2E checks of spec §3 were run on `gpt-oss-20b` served by OVHcloud's anonymous AI
+Endpoints tier (no key; 2 requests per minute per IP with rejected requests counted, so
+about one request per minute in practice; `parallel_tool_calls` unsupported;
+`reasoning_effort` supported). Configuration: `ORDER_SEED = 42`, temperature 0, seed 42,
+`MAX_TOKENS = 32768`, `CONTEXT_TOKENS_LIMIT = 131072`, `REQUEST_INTERVAL_S = 62`, no SDK
+retries, harness retries on 429 with the announced `retry-after`. Raw outputs are under
+`data/02-raw-retrieval-baseline-agent-infrastructure/runs/` (git-ignored);
+`src/summarize_run.py` prints the numbers below.
+
+**What the model does with raw series.** With the default reasoning effort the model
+spends its whole reply reasoning over the 1,500 numbers it retrieved: the first attempt
+hit `MAX_TOKENS = 8192` inside the reasoning and produced no reply at all
+(`protocol_error`), the second produced one verdict after 3,250 reasoning tokens, and
+with `MAX_TOKENS = 32768` two attempts in a row exceeded a 300 s timeout on the very first
+judging request. With `reasoning_effort = "low"` replies come in 40-70 output tokens and
+the reasoning reads, verbatim, "Hard to scan. Maybe pick simpler series." - "Huge. Hard.
+Maybe pick WSD series." - "Hard. Maybe skip. Probably normal." The model retrieves one to
+three series, judges at most one or two, and stops; it never re-fetches. Every verdict it
+produced for `R1__IOPS__KPI-8_chunk54` (label 0) at low effort was `normal`; the one at
+medium effort was `anomalous`, citing ordinary 2-point dips as evidence.
+
+**What the harness does.** Every episode ended with a recorded reason and closed files:
+`protocol_error` (reasoning cut by `max_tokens`), `model_error` (timeouts), `budget`
+(the projection refused a fourth, ~49k-token payload that would not fit the window) and
+`completed`. The missing-verdict check fired in two episodes and recovered a verdict in
+one ("DONE 0" after retrieving a series, then `normal` on the nudge); in the other the
+nudge itself became a 57k-token request that timed out. Stray tool arguments
+(`get_pool_meta_data({"": ""})`, sent by gpt-oss on every first turn) cost a retry until
+the tools were made to ignore them.
+
+**Determinism (FR7).** No replay pair agreed: with identical prompts, temperature 0 and
+`seed = 42`, the model's reasoning text differs from the second or third request on, and
+the episodes diverge (one fetches a second series, the other replies with text). The
+harness itself replays identically (scripted model, three replays, byte-identical
+verdicts), so this is the endpoint's property - batched inference on a free tier - and
+`compare_runs` reports it instead of hiding it. FR7 therefore holds for the harness and
+has to be re-checked per endpoint; a locally served model with a fixed batch size is the
+way to get it end to end.
+
+Dev-subset pairs (R1 `dev` split, served order seed 42, first 5 series; two episodes each):
+
+| Run | Effort | Requests | Series retrieved / judged | Termination | Tokens (in / out) | Wall |
+|-----|--------|----------|---------------------------|-------------|-------------------|------|
+| pair 1, episode 1 | medium, `MAX_TOKENS` 8192 | 4 | 1 / 0 | `protocol_error` (reasoning cut) | 13.6k / 8.3k | 234 s |
+| pair 1, episode 2 | medium, `MAX_TOKENS` 8192 | 4 | 1 / 1 (`anomalous`, label 0) | `completed` | 13.6k / 3.4k | 254 s |
+| pair 2, both episodes | medium, `MAX_TOKENS` 32768, timeout 300 s | 2-3 | 1-2 / 0 | `model_error` (timeout) | - | ~500 s |
+| pair 3, episode 1 | low | 5 | 3 / 0 | `budget` (4th payload would not fit) | 93.5k / 0.3k | 303 s |
+| pair 3, episode 2 | low | 3 | 1 / 1 (`normal`, label 0) | `completed` | 12.6k / 0.1k | 173 s |
+| pair 4, episode 1 | low, closing turn on | 5 | 3 / 1 (`normal`, label 0) | `model_error` (57k-token nudge timed out) | 93.4k / 0.2k | 1,343 s |
+| pair 4, episode 2 | low, closing turn on | 4 | 1 / 1 (`normal`, label 0) | `completed` (after the nudge) | 23.3k / 0.2k | 188 s |
+
+**Full R1 run** (all 2,900 series served, seed 42, low effort, final harness): three
+requests. The id list alone made the second request 53.6k tokens; the model picked
+`R1__WSD__WSD_90_chunk0` ("let's pick a manageable one"), a 4,320-point series whose
+payload took the third request to 86.7k tokens, judged it `anomalous` on a "quick glance"
+- a spike "at index 4000" in a series the labels call normal - and stopped. Termination
+`completed`, 1 of 2,900 series examined and judged, 141.7k tokens, 206 s. That is the
+raw-retrieval baseline on a real pool: within the constitution's daily budget it covers
+one series, and the trace says exactly where the tokens went (a third of them to the id
+list). The verdicts, traces and summaries of these runs are kept under
+[`results/`](results/) (messages files with the raw payloads are not).
 
 ## What to expect from a full run
 
