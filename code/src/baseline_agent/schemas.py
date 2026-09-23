@@ -164,7 +164,9 @@ class ToolCallRecord(_Strict):
     duration_ms: float
 
 
-RetryKind = Literal["tool", "output"]
+RetryKind = Literal["tool", "output", "closing"]
+"""Why a request carries a harness prompt: invalid tool arguments, verdicts missing when
+the model stopped, or the closing turn after a budget stop."""
 
 
 class ModelRequestRecord(_Strict):
@@ -254,6 +256,7 @@ class VerdictCounts(_Strict):
 class RetryCounts(_Strict):
     tool: int
     output: int
+    closing: int
 
 
 class RunEndRecord(_Strict):

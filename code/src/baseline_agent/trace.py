@@ -114,7 +114,7 @@ class TraceRecorder:
         self.requests: list[ModelRequestRecord] = []
         self.verdict_events: list[VerdictEvent] = []
         self.series: OrderedDict[str, _SeriesStats] = OrderedDict()
-        self.retries: dict[str, int] = {"tool": 0, "output": 0}
+        self.retries: dict[str, int] = {"tool": 0, "output": 0, "closing": 0}
         self._t0 = time.perf_counter()
         self._started_at = now_iso()
 
@@ -149,6 +149,13 @@ class TraceRecorder:
         sid = raw_args.get("series_id")
         handle = ToolCallHandle(tool_name, tool_call_id or "", raw_args, sid if isinstance(sid, str) else None)
         handle.error = error
+        self._record_call(handle, request_index, now_iso(), 0.0)
+
+    def skipped_tool_call(self, tool_name: str, tool_call_id: str | None, args: Any, *, request_index: int, series_id: str | None) -> None:
+        """A call the model issued but the budget stop left unexecuted."""
+        raw_args = args if isinstance(args, dict) else {"raw": args}
+        handle = ToolCallHandle(tool_name, tool_call_id or "", raw_args, series_id)
+        handle.error = "not executed: the episode's token budget was exhausted before this call"
         self._record_call(handle, request_index, now_iso(), 0.0)
 
     def _record_call(self, handle: ToolCallHandle, request_index: int, started_at: str, duration_ms: float) -> None:
@@ -266,7 +273,7 @@ class TraceRecorder:
             duration_ms=round((time.perf_counter() - self._t0) * 1000.0, 3),
             termination=termination,
             requests=len(self.requests),
-            retries=RetryCounts(tool=self.retries["tool"], output=self.retries["output"]),
+            retries=RetryCounts(tool=self.retries["tool"], output=self.retries["output"], closing=self.retries["closing"]),
             tool_calls=ToolCallCounts(
                 get_series=sum(c.tool_name == "get_series" for c in self.tool_calls),
                 get_pool_meta_data=sum(c.tool_name == "get_pool_meta_data" for c in self.tool_calls),

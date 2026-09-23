@@ -33,7 +33,7 @@ There are no other tools - no statistics, no detectors, no plots. Every conclusi
    {"series_id": "<id>", "verdict": "normal"}
    {"series_id": "<id>", "verdict": "anomalous", "explanation": "<evidence>"}
    The explanation is mandatory for anomalous verdicts and must cite concrete evidence from the values you retrieved: the time_index positions or ranges involved and the values or magnitudes observed there. Normal verdicts take no explanation.
-4. Move on to the next series, or stop.
+4. Only then move on to the next series, or stop.
 
 How turns work: a reply that calls a tool continues the episode; a reply with no tool call ends it for good. So when you have a verdict and want to examine another series, put the verdict line and the next get_series call in the same reply.
 

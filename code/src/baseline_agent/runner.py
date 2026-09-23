@@ -92,6 +92,10 @@ REPLAY_VARIANT_MESSAGE_FIELDS = frozenset(
     }
 )
 
+TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+NOT_EXECUTED = "Error: not retrieved - the episode's token budget is exhausted. No further tool call will be executed."
+
 
 @dataclass(frozen=True)
 class EpisodeConfig:
@@ -195,9 +199,6 @@ class EpisodeResult:
     @property
     def usage(self) -> UsageFields:
         return self.run_end.usage
-
-
-TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 class _RecordingModel(WrapperModel):
@@ -398,7 +399,14 @@ async def _drive(
     limits: UsageLimits,
     verdict_writer: VerdictWriter,
 ) -> tuple[Termination, list[M.ModelMessage]]:
-    """Step through the agent graph, recording each model request and ingesting its text."""
+    """Step through the agent graph, recording each model request and ingesting its text.
+
+    When the budget projection stops the episode before a retrieval, and the model still
+    owes verdicts for series it did retrieve, one closing turn follows: the pending call is
+    answered with :data:`NOT_EXECUTED` and the model is asked for the verdicts it owes -
+    the same rule the output validator applies when the model stops by itself, never a
+    request to examine anything more.
+    """
     recorder, collector, pool = deps.recorder, deps.collector, deps.pool
     request_index = 0
     termination = Termination(reason="completed")
@@ -443,58 +451,75 @@ async def _drive(
         )
         return record
 
+    async def _loop(active_run: Any, *, execute_tools: bool, first_kind: RetryKind | None) -> tuple[Termination | None, M.ModelResponse | None]:
+        """Advance ``active_run`` to its end. Returns a budget stop (and the response whose
+        tool calls were not executed) or, with ``execute_tools`` off, the first response
+        that asked for a tool."""
+        nonlocal request_index, pending, last_request_at
+        node = active_run.next_node
+        first = True
+        while not Agent.is_end_node(node):
+            if Agent.is_model_request_node(node):
+                request_index += 1
+                history = list(active_run.all_messages())
+                if not history or history[-1] is not node.request:
+                    history.append(node.request)
+                if config.request_interval_s > 0 and last_request_at is not None:
+                    wait = config.request_interval_s - (time.perf_counter() - last_request_at)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                last_request_at = time.perf_counter()
+                pending = {
+                    "retry_kind": _retry_kind(node.request.parts) or (first_kind if first else None),
+                    "history_chars": history_chars(history, instructions=config.system_prompt),
+                    "started_at": now_iso(),
+                    "t0": time.perf_counter(),
+                }
+                first = False
+                next_node = await active_run.next(node)
+                duration_ms = (time.perf_counter() - pending["t0"]) * 1000.0
+                if Agent.is_call_tools_node(next_node):
+                    response = next_node.model_response
+                    record = _record_response(
+                        response,
+                        started_at=pending["started_at"],
+                        duration_ms=duration_ms,
+                        retry_kind=pending["retry_kind"],
+                        history_chars=pending["history_chars"],
+                    )
+                    pending = None
+                    has_tool_calls = any(isinstance(p, M.ToolCallPart) for p in response.parts)
+                    if has_tool_calls and not execute_tools:
+                        return None, response
+                    stop = _budget_stop(record, response, deps, config)
+                    if stop is not None:
+                        return stop, response
+                pending = None
+                node = next_node
+            elif Agent.is_call_tools_node(node):
+                async with node.stream(active_run.ctx) as stream:
+                    async for event in stream:
+                        if isinstance(event, M.FunctionToolResultEvent) and isinstance(event.part, M.RetryPromptPart):
+                            recorder.invalid_tool_call(
+                                event.part.tool_name or "?",
+                                event.part.tool_call_id,
+                                _args_of(node.model_response, event.part.tool_call_id),
+                                event.part.model_response(),
+                                request_index=request_index,
+                            )
+                node = await active_run.next(node)
+            else:
+                node = await active_run.next(node)
+        return None, None
+
     try:
         with Agent.parallel_tool_call_execution_mode("sequential"):
             async with agent.iter(config.user_prompt, deps=deps, usage_limits=limits) as run:
-                node = run.next_node
-                while not Agent.is_end_node(node):
-                    if Agent.is_model_request_node(node):
-                        request_index += 1
-                        history = list(run.all_messages())
-                        if not history or history[-1] is not node.request:
-                            history.append(node.request)
-                        if config.request_interval_s > 0 and last_request_at is not None:
-                            wait = config.request_interval_s - (time.perf_counter() - last_request_at)
-                            if wait > 0:
-                                await asyncio.sleep(wait)
-                        last_request_at = time.perf_counter()
-                        pending = {
-                            "retry_kind": _retry_kind(node.request.parts),
-                            "history_chars": history_chars(history, instructions=config.system_prompt),
-                            "started_at": now_iso(),
-                            "t0": time.perf_counter(),
-                        }
-                        next_node = await run.next(node)
-                        duration_ms = (time.perf_counter() - pending["t0"]) * 1000.0
-                        stop: Termination | None = None
-                        if Agent.is_call_tools_node(next_node):
-                            record = _record_response(
-                                next_node.model_response,
-                                started_at=pending["started_at"],
-                                duration_ms=duration_ms,
-                                retry_kind=pending["retry_kind"],
-                                history_chars=pending["history_chars"],
-                            )
-                            stop = _budget_stop(record, next_node.model_response, deps, config)
-                        pending = None
-                        if stop is not None:
-                            termination = stop
-                            break
-                        node = next_node
-                    elif Agent.is_call_tools_node(node):
-                        async with node.stream(run.ctx) as stream:
-                            async for event in stream:
-                                if isinstance(event, M.FunctionToolResultEvent) and isinstance(event.part, M.RetryPromptPart):
-                                    recorder.invalid_tool_call(
-                                        event.part.tool_name or "?",
-                                        event.part.tool_call_id,
-                                        _args_of(node.model_response, event.part.tool_call_id),
-                                        event.part.model_response(),
-                                        request_index=request_index,
-                                    )
-                        node = await run.next(node)
-                    else:
-                        node = await run.next(node)
+                stop, stopped_response = await _loop(run, execute_tools=True, first_kind=None)
+            if stop is not None:
+                termination = stop
+                if stopped_response is not None:
+                    termination, run = await _closing_turn(agent, run, stopped_response, termination, deps, config, limits, _loop)
     except UsageLimitExceeded as exc:
         termination = Termination(reason="usage_limit", detail=_short(exc))
     except UnexpectedModelBehavior as exc:
@@ -521,6 +546,63 @@ async def _drive(
         if not any(m is recording.last_response for m in messages):
             messages.append(recording.last_response)
     return termination, messages
+
+
+async def _closing_turn(
+    agent: Agent[EpisodeDeps, str],
+    run: Any,
+    stopped_response: M.ModelResponse,
+    termination: Termination,
+    deps: EpisodeDeps,
+    config: EpisodeConfig,
+    limits: UsageLimits,
+    loop: Any,
+) -> tuple[Termination, Any]:
+    """After a budget stop: collect the verdicts owed for retrieved series, if that fits."""
+    recorder, collector = deps.recorder, deps.collector
+    owed = collector.missing_verdicts()
+    if not owed or not deps.enforce_verdicts:
+        return termination, run
+    last = recorder.requests[-1]
+    cpt = config.chars_per_token_estimate
+    context = last.usage.input_tokens if last.usage.input_tokens > 0 else math.ceil(last.history_chars / cpt)
+    allowance = config.max_tokens if config.max_tokens is not None else config.output_allowance_tokens
+    closing_input = context + last.usage.output_tokens + 400
+    over_context = config.context_tokens_limit is not None and closing_input + allowance > config.context_tokens_limit
+    over_budget = config.total_tokens_limit is not None and recorder.total_tokens() + closing_input + allowance > config.total_tokens_limit
+    if over_context or over_budget:
+        note = f" [no closing turn: it would not fit either; {len(owed)} retrieved series remain unjudged]"
+        return Termination(reason=termination.reason, detail=(termination.detail or "") + note), run
+    pending_calls = [p for p in stopped_response.parts if isinstance(p, M.ToolCallPart)]
+    for part in pending_calls:
+        args = _args_as_dict(part)
+        sid = args.get("series_id")
+        real = deps.ids.resolve(sid) if isinstance(sid, str) else None
+        recorder.skipped_tool_call(part.tool_name, part.tool_call_id, args, request_index=last.request_index, series_id=real if real is not None else (sid if isinstance(sid, str) else None))
+    returns = [M.ToolReturnPart(tool_name=p.tool_name, content=NOT_EXECUTED, tool_call_id=p.tool_call_id) for p in pending_calls]
+    history = list(run.all_messages())
+    history.append(M.ModelRequest(parts=[*returns, M.UserPromptPart(closing_prompt([deps.ids.display(s) for s in owed]))]))
+    logger.info("budget stop with %d retrieved series unjudged; asking for their verdicts in a closing turn", len(owed))
+    async with agent.iter(None, message_history=history, deps=deps, usage_limits=limits, usage=run.usage) as closing_run:
+        _, refused = await loop(closing_run, execute_tools=False, first_kind="closing")
+    still_owed = collector.missing_verdicts()
+    if refused is not None:
+        note = f" [closing turn asked for another tool call instead of verdicts; not executed; {len(still_owed)} retrieved series remain unjudged]"
+    elif still_owed:
+        note = f" [closing turn left {len(still_owed)} retrieved series unjudged]"
+    else:
+        note = " [closing turn collected the verdicts for the retrieved series]"
+    return Termination(reason=termination.reason, detail=(termination.detail or "") + note), closing_run
+
+
+def closing_prompt(owed_ids: Sequence[str], *, max_ids: int = 20) -> str:
+    shown = ", ".join(owed_ids[:max_ids])
+    more = f" (and {len(owed_ids) - max_ids} more)" if len(owed_ids) > max_ids else ""
+    return (
+        "The episode's token budget is exhausted: the retrieval you just requested was not performed, and no "
+        f"further tool call will be executed. Reply now with one verdict line for each series you retrieved that "
+        f"still has no verdict - {shown}{more} - then the DONE line."
+    )
 
 
 # --- budget projection ------------------------------------------------------------------

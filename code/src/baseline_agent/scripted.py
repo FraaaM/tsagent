@@ -26,7 +26,7 @@ from pydantic_ai.usage import RequestUsage
 from .tools import is_error
 from .verdicts import parse_verdicts
 
-Misbehaviour = Literal["skip_last_verdict", "blind_verdict", "unknown_id", "bad_json", "never_stop", "quit_early"]
+Misbehaviour = Literal["skip_last_verdict", "blind_verdict", "unknown_id", "bad_json", "never_stop", "quit_early", "defer_verdicts"]
 
 MODEL_NAME = "scripted"
 
@@ -39,6 +39,7 @@ class _State:
     verdicted: set[str]
     last_returns: list[M.ToolReturnPart]
     retry: M.RetryPromptPart | None
+    closing: bool  # the harness asked for the verdicts owed after a budget stop
     n_responses: int
 
 
@@ -72,19 +73,20 @@ class ScriptedPolicy:
     def _decide(self, s: _State) -> list[M.ModelResponsePart]:
         if s.ids is None:
             return [M.ToolCallPart("get_pool_meta_data", {})]
-        if s.retry is not None:
+        if s.retry is not None or s.closing:
             pending = [sid for sid in s.fetched if sid not in s.verdicted]
             lines = [self._verdict_line(sid, s.fetched[sid]) for sid in pending]
             return [M.TextPart("\n".join(lines + [f"DONE {len(s.fetched)}"]))]
 
         lines: list[str] = []
-        for ret in s.last_returns:
-            if ret.tool_name != "get_series":
-                continue
-            sid = _series_id_of(ret)
-            if sid is None or sid not in s.fetched or sid in s.verdicted:
-                continue
-            lines.append(self._verdict_line(sid, s.fetched[sid]))
+        if self.misbehave != "defer_verdicts":
+            for ret in s.last_returns:
+                if ret.tool_name != "get_series":
+                    continue
+                sid = _series_id_of(ret)
+                if sid is None or sid not in s.fetched or sid in s.verdicted:
+                    continue
+                lines.append(self._verdict_line(sid, s.fetched[sid]))
 
         if self.misbehave == "quit_early" and s.n_responses >= 1:
             return [M.TextPart("DONE 0")]
@@ -105,6 +107,8 @@ class ScriptedPolicy:
             parts.append(M.ToolCallPart("get_series", {"series_id": next_id}))
             return parts
 
+        if self.misbehave == "defer_verdicts":
+            lines = [self._verdict_line(sid, s.fetched[sid]) for sid in s.fetched if sid not in s.verdicted]
         if self.misbehave == "skip_last_verdict" and lines:
             lines = lines[:-1]
         if self.misbehave == "blind_verdict" and remaining:
@@ -164,11 +168,13 @@ class ScriptedPolicy:
         verdicted: set[str] = set()
         last_returns: list[M.ToolReturnPart] = []
         retry: M.RetryPromptPart | None = None
+        closing = False
         n_responses = 0
         for msg in messages:
             if isinstance(msg, M.ModelRequest):
                 last_returns = []
                 retry = None
+                closing = n_responses > 0 and any(isinstance(p, M.UserPromptPart) for p in msg.parts)
                 for part in msg.parts:
                     if isinstance(part, M.ToolReturnPart):
                         last_returns.append(part)
@@ -190,7 +196,7 @@ class ScriptedPolicy:
                         for cand in parse_verdicts(part.content):
                             if cand.record is not None:
                                 verdicted.add(cand.record.series_id)
-        return _State(ids, fetched, failed, verdicted, last_returns, retry, n_responses)
+        return _State(ids, fetched, failed, verdicted, last_returns, retry, closing, n_responses)
 
     def _estimate(self, text: str) -> int:
         return max(1, len(text) // self.chars_per_token)

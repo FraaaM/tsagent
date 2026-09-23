@@ -241,7 +241,7 @@ def minimal_trace() -> list[dict]:
             tool_time_ms=0.2, verdict="normal", verdict_revisions=0, attributed_usage=AttributedUsage(requests=1.0, input_tokens=100.0, output_tokens=10.0, total_tokens=110.0),
         ).model_dump(),
         RunEndRecord(
-            finished_at="t", duration_ms=3.0, termination={"reason": "completed"}, requests=2, retries={"tool": 0, "output": 0},
+            finished_at="t", duration_ms=3.0, termination={"reason": "completed"}, requests=2, retries={"tool": 0, "output": 0, "closing": 0},
             tool_calls={"get_series": 1, "get_pool_meta_data": 1, "failed": 0}, usage=usage, overhead_usage=zero_attributed(),
             series={"in_pool": 1, "examined": 1, "verdicted": 1, "anomalous": 0, "normal": 1, "examined_without_verdict": 0},
             verdicts={"accepted": 1, "rejected": 0, "revised": 0},

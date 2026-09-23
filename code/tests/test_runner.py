@@ -104,7 +104,7 @@ class TestHappyPath:
         assert end.overhead_usage.requests == 2  # the prompt-only first turn and the metadata turn
         assert sum(r.verdicts_accepted for r in requests) == end.verdicts.accepted == 5
         assert by_kind(records, VerdictEvent)[0].request_index == 3
-        assert end.retries.model_dump() == {"tool": 0, "output": 0}
+        assert end.retries.model_dump() == {"tool": 0, "output": 0, "closing": 0}
         # the trace is chronological: a request's verdict events follow its own record
         kinds = [r.kind for r in records]
         assert kinds[:4] == ["run_start", "model_request", "tool_call", "model_request"]
@@ -266,6 +266,56 @@ class TestTermination:
         assert all(c.request_index < last.request_index for c in by_kind(records, ToolCallRecord))
         assert end.requests == sum(m["kind"] == "response" for m in messages_of(result))
 
+    def test_budget_stop_collects_the_verdicts_owed_in_a_closing_turn(self, tiny_pool, tmp_path):
+        # the stand-in fetches every series before judging any; the cap cuts it off first
+        limit = 12_000
+        result = run(tiny_pool, tmp_path, total_tokens_limit=limit, chars_per_token_estimate=1.5, output_allowance_tokens=100, scripted_options={"misbehave": "defer_verdicts"})
+        records = trace_of(result)
+        end = records[-1]
+        requests = by_kind(records, ModelRequestRecord)
+        assert end.termination.reason == "budget" and "closing turn collected the verdicts" in (end.termination.detail or "")
+        assert end.series.examined >= 2 and end.series.examined_without_verdict == 0 and end.series.verdicted == end.series.examined
+        assert end.retries.model_dump() == {"tool": 0, "output": 0, "closing": 1}
+        assert requests[-1].retry_kind == "closing" and requests[-1].verdicts_accepted == end.series.verdicted
+        assert end.usage.total_tokens <= limit
+        skipped = [c for c in by_kind(records, ToolCallRecord) if not c.ok]
+        assert len(skipped) == 1 and "not executed" in (skipped[0].error or "") and skipped[0].request_index == requests[-2].request_index
+        messages = messages_of(result)
+        closing_request = messages[-2]
+        kinds = [p["part_kind"] for p in closing_request["parts"]]
+        assert kinds == ["tool-return", "user-prompt"] and "budget is exhausted" in closing_request["parts"][0]["content"]
+        assert end.requests == sum(m["kind"] == "response" for m in messages)
+        validate_verdicts_file(result.files[VERDICTS_FILE])
+
+    def test_closing_turn_is_skipped_when_it_would_not_fit(self, tiny_pool, tmp_path):
+        # a large reply allowance makes the stop fire while the context is still small, and
+        # leaves no room for the closing request either
+        # (with the stand-in's fixed token estimates: the stop fires on the third response,
+        # after one series, and 6,300 + the context no longer fit under the cap)
+        result = run(tiny_pool, tmp_path, total_tokens_limit=12_000, chars_per_token_estimate=1.5, output_allowance_tokens=6_300, scripted_options={"misbehave": "defer_verdicts"})
+        end = trace_of(result)[-1]
+        assert end.termination.reason == "budget" and "no closing turn" in (end.termination.detail or ""), end.termination.detail
+        assert end.retries.closing == 0 and end.series.examined_without_verdict == end.series.examined >= 1
+        assert end.usage.total_tokens <= 12_000
+
+    def test_closing_turn_never_executes_a_tool(self, tiny_pool, tmp_path):
+        inner = ScriptedPolicy(misbehave="defer_verdicts")
+
+        def greedy(messages, info):
+            last = messages[-1].parts
+            if any(isinstance(p, M.UserPromptPart) and "budget is exhausted" in str(p.content) for p in last):
+                return M.ModelResponse(parts=[M.ToolCallPart("get_series", {"series_id": tiny_pool.series_ids[-1]})], usage=usage())
+            return inner(messages, info)
+
+        cfg = config(model="greedy", total_tokens_limit=12_000, chars_per_token_estimate=1.5, output_allowance_tokens=100)
+        result = run_episode(tiny_pool, cfg, tmp_path / "g", model=FunctionModel(greedy))
+        records = trace_of(result)
+        end = records[-1]
+        assert end.termination.reason == "budget" and "asked for another tool call" in (end.termination.detail or "")
+        executed = [c for c in by_kind(records, ToolCallRecord) if c.ok]
+        assert all(c.request_index < by_kind(records, ModelRequestRecord)[-1].request_index for c in executed)
+        assert end.series.examined_without_verdict == end.series.examined >= 1 and end.retries.closing == 1
+
     def test_context_window_projection(self, tiny_pool, tmp_path):
         result = run(tiny_pool, tmp_path, context_tokens_limit=6_000, chars_per_token_estimate=1.5, output_allowance_tokens=100)
         end = trace_of(result)[-1]
@@ -374,7 +424,7 @@ class TestTermination:
         records = trace_of(result)
         end = records[-1]
         assert end.termination.reason == "protocol_error" and "retries" in (end.termination.detail or "")
-        assert end.retries.model_dump() == {"tool": 0, "output": 1}
+        assert end.retries.model_dump() == {"tool": 0, "output": 1, "closing": 0}
         assert end.series.examined_without_verdict == 1 and end.series.verdicted == 0
         assert [r.retry_kind for r in by_kind(records, ModelRequestRecord)] == [None, None, "output"]
 
@@ -384,7 +434,7 @@ class TestProtocolCounterMeasures:
         result = run(tiny_pool, tmp_path, scripted_options={"misbehave": "skip_last_verdict"})
         records = trace_of(result)
         end = records[-1]
-        assert end.termination.reason == "completed" and end.retries.model_dump() == {"tool": 0, "output": 1}
+        assert end.termination.reason == "completed" and end.retries.model_dump() == {"tool": 0, "output": 1, "closing": 0}
         assert end.series.verdicted == 5 and end.series.examined_without_verdict == 0
         retry_requests = [r for r in by_kind(records, ModelRequestRecord) if r.is_retry]
         assert len(retry_requests) == 1 and retry_requests[0].retry_kind == "output" and retry_requests[0].verdicts_accepted == 1
@@ -467,5 +517,5 @@ class TestProtocolCounterMeasures:
         assert end.termination.reason == "completed" and end.series.verdicted == 1
         assert [(c.tool_name, c.ok) for c in calls] == [("get_series", False), ("cheap_scan", False), ("get_series", True)]
         assert end.tool_calls.failed == 2 and end.tool_calls.get_series == 2
-        assert end.retries.model_dump() == {"tool": 2, "output": 0}
+        assert end.retries.model_dump() == {"tool": 2, "output": 0, "closing": 0}
         assert [r.retry_kind for r in by_kind(records, ModelRequestRecord)] == [None, "tool", "tool", None]

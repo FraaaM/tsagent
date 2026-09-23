@@ -255,7 +255,7 @@ class TestAgentWrappers:
             ("get_pool_meta_data", True, {"": ""}),
             ("get_series", True, {"series_id": sid, "format": "json"}),
         ]
-        assert deps.recorder.retries == {"tool": 0, "output": 0} and dict(deps.collector.examined) == {sid: 1}
+        assert deps.recorder.retries == {"tool": 0, "output": 0, "closing": 0} and dict(deps.collector.examined) == {sid: 1}
 
     def test_aliased_wrappers_translate_both_ways(self, tiny_pool, tmp_path):
         aliases = IdAliases(tiny_pool.series_ids)
