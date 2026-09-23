@@ -61,7 +61,7 @@ class EpisodeDeps:
         return self._meta_chars
 
 
-def get_series(ctx: RunContext[EpisodeDeps], series_id: str) -> str:
+def get_series(ctx: RunContext[EpisodeDeps], series_id: str, **ignored: Any) -> str:
     """Return the full raw series with the given id.
 
     The result is a JSON document with the fields series_id, length, time_index (integer
@@ -71,10 +71,13 @@ def get_series(ctx: RunContext[EpisodeDeps], series_id: str) -> str:
     Args:
         series_id: Identifier of the series, exactly as listed by get_pool_meta_data.
     """
+    # ``**ignored``: stray arguments some models add (gpt-oss sends ``{"": ""}`` to a
+    # no-argument tool) are dropped rather than refused - a refusal costs a whole
+    # request on a rate-limited tier. The trace still records what the model sent.
     deps = ctx.deps
     real = deps.ids.resolve(series_id)
     with deps.recorder.tool_call(
-        "get_series", ctx.tool_call_id, {"series_id": series_id}, request_index=ctx.run_step, series_id=real if real is not None else series_id
+        "get_series", ctx.tool_call_id, {"series_id": series_id, **ignored}, request_index=ctx.run_step, series_id=real if real is not None else series_id
     ) as call:
         if real is None:
             # Only names the model was given resolve; with aliasing on, a pool id it may
@@ -88,10 +91,10 @@ def get_series(ctx: RunContext[EpisodeDeps], series_id: str) -> str:
     return text
 
 
-def get_pool_meta_data(ctx: RunContext[EpisodeDeps]) -> str:
+def get_pool_meta_data(ctx: RunContext[EpisodeDeps], **ignored: Any) -> str:
     """Return the pool's metadata: its name, its size and the list of all series ids."""
     deps = ctx.deps
-    with deps.recorder.tool_call("get_pool_meta_data", ctx.tool_call_id, {}, request_index=ctx.run_step) as call:
+    with deps.recorder.tool_call("get_pool_meta_data", ctx.tool_call_id, dict(ignored), request_index=ctx.run_step) as call:
         text = _pool_meta_data(deps.pool, series_ids=deps.ids.served)
         call.finish(text)
     return text

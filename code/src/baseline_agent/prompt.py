@@ -27,13 +27,15 @@ A series is anomalous when it contains at least one anomalous point or segment r
 There are no other tools - no statistics, no detectors, no plots. Every conclusion must come from reading the raw values yourself.
 
 ## Protocol
-1. Call get_pool_meta_data once to learn which series exist.
+1. Call get_pool_meta_data once, with no arguments, to learn which series exist.
 2. Choose a series, call get_series, read the values, decide.
 3. Emit the verdict as one JSON object on a line of its own, exactly in one of these two forms:
    {"series_id": "<id>", "verdict": "normal"}
    {"series_id": "<id>", "verdict": "anomalous", "explanation": "<evidence>"}
    The explanation is mandatory for anomalous verdicts and must cite concrete evidence from the values you retrieved: the time_index positions or ranges involved and the values or magnitudes observed there. Normal verdicts take no explanation.
 4. Move on to the next series, or stop.
+
+How turns work: a reply that calls a tool continues the episode; a reply with no tool call ends it for good. So when you have a verdict and want to examine another series, put the verdict line and the next get_series call in the same reply.
 
 Rules: judge only series whose values you retrieved in this episode - a verdict for a series you did not retrieve is discarded; never invent series ids; you may retrieve a series again and you may re-issue a verdict for it, in which case the last verdict counts.
 

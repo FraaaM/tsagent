@@ -235,6 +235,28 @@ class TestAgentWrappers:
         lines = [json.loads(l) for l in (tmp_path / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
         assert [l["kind"] for l in lines] == ["tool_call"] * 3
 
+    def test_stray_tool_arguments_are_ignored_not_refused(self, tiny_pool, tmp_path):
+        sid = tiny_pool.series_ids[0]
+
+        def policy(messages, info):
+            last = messages[-1].parts
+            if any(isinstance(p, M.UserPromptPart) for p in last):
+                return M.ModelResponse(parts=[M.ToolCallPart("get_pool_meta_data", {"": ""})], usage=RequestUsage(input_tokens=1, output_tokens=1))
+            if any(isinstance(p, M.ToolReturnPart) and p.tool_name == "get_pool_meta_data" for p in last):
+                return M.ModelResponse(parts=[M.ToolCallPart("get_series", {"series_id": sid, "format": "json"})], usage=RequestUsage(input_tokens=1, output_tokens=1))
+            return M.ModelResponse(parts=[M.TextPart(json.dumps({"series_id": sid, "verdict": "normal"}) + "\nDONE 1")], usage=RequestUsage(input_tokens=1, output_tokens=1))
+
+        agent = build_agent(FunctionModel(policy))
+        deps, writer = make_deps(tiny_pool, tmp_path)
+        agent.run_sync(USER_PROMPT, deps=deps)
+        writer.close()
+        calls = deps.recorder.tool_calls
+        assert [(c.tool_name, c.ok, c.args) for c in calls] == [
+            ("get_pool_meta_data", True, {"": ""}),
+            ("get_series", True, {"series_id": sid, "format": "json"}),
+        ]
+        assert deps.recorder.retries == {"tool": 0, "output": 0} and dict(deps.collector.examined) == {sid: 1}
+
     def test_aliased_wrappers_translate_both_ways(self, tiny_pool, tmp_path):
         aliases = IdAliases(tiny_pool.series_ids)
         real = tiny_pool.series_ids[3]

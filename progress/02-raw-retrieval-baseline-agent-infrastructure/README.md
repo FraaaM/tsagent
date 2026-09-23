@@ -97,7 +97,8 @@ Useful knobs:
 | `POOL_FILE`, `SPLIT`, `SERIES_LIMIT` | which pool, optionally one split (`dev`/`test`) or the first N series of the served order |
 | `ORDER_SEED` | seeded permutation of the order the agent is shown (`None` = file order) |
 | `ALIAS_SERIES_IDS` | show the agent opaque ids instead of the provenance-carrying spec-01 ids (off by default) |
-| `MODEL`, `MODEL_BASE_URL`, `MODEL_API_KEY_ENV` | which LLM, and where (see below) |
+| `MODEL`, `MODEL_BASE_URL`, `MODEL_API_KEY_ENV` / `MODEL_API_KEY_FILE`, `MODEL_ANONYMOUS` | which LLM, where, and how to authenticate (see below) |
+| `REQUEST_INTERVAL_S`, `TRANSIENT_RETRIES`, `RATE_LIMIT_WAIT_S` | pacing for rate-limited tiers, and how long the harness keeps retrying 429 / 5xx answers |
 | `TEMPERATURE = 0.0`, `SEED = 42`, `PARALLEL_TOOL_CALLS = False` | greedy, seeded decoding, one retrieval per turn (FR7, idea B) |
 | `REQUEST_LIMIT`, `TOOL_CALLS_LIMIT` | pydantic-ai's episode caps; both default to 2 per series + 8 |
 | `TOTAL_TOKENS_LIMIT`, `CONTEXT_TOKENS_LIMIT` | the token budget (default: the constitution's 1M) and the model's window; the harness stops *before* the request that would break either |
@@ -132,12 +133,32 @@ MODEL = "openrouter:openai/gpt-oss-20b"    # OPENROUTER_API_KEY
 MODEL = "anthropic:claude-sonnet-4-5"      # ANTHROPIC_API_KEY - harness checks only, out of the 20B constraint
 ```
 
+Free tiers work through the same `MODEL_BASE_URL` path. Two of them were tried (see
+[End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints)):
+
+```python
+# OVHcloud AI Endpoints, anonymous: no key, 2 requests per minute per IP, and a rejected
+# request counts against the window - so no SDK retries, and the harness waits for the
+# retry-after the server announces
+MODEL = "openai-chat:gpt-oss-20b"
+MODEL_BASE_URL = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
+MODEL_ANONYMOUS = True
+REQUEST_INTERVAL_S = 35.0
+
+# Z.AI (Zhipu), free GLM flash models: a key from the platform's console, kept in a file
+# outside the repository (or in an environment variable named by MODEL_API_KEY_ENV)
+MODEL = "openai-chat:glm-4.7-flash"
+MODEL_BASE_URL = "https://api.z.ai/api/paas/v4"
+MODEL_API_KEY_FILE = _REPO.parent / "zai_api_key.txt"
+```
+
 Provider-specific settings go into `EXTRA_MODEL_SETTINGS` (for example
-`{"openai_reasoning_effort": "low"}`). `SEED` is honoured by OpenAI-style chat endpoints
-and vLLM and ignored by providers that do not expose one; pydantic-ai drops `temperature`
-for the newest Claude models, which do not accept it. `CONTEXT_TOKENS_LIMIT` should be set
-to the served model's window so the episode ends with a recorded `budget` stop instead of
-a provider error. With `REPLAYS = 2` the script says whether the two episodes agree, so the
+`{"openai_reasoning_effort": "low"}`, or `{"extra_body": {"thinking": {"type":
+"disabled"}}}` for GLM). `SEED` is honoured by OpenAI-style chat endpoints and vLLM and
+ignored by providers that do not expose one; pydantic-ai drops `temperature` for the
+newest Claude models, which do not accept it. `CONTEXT_TOKENS_LIMIT` should be set to the
+served model's window so the episode ends with a recorded `budget` stop instead of a
+provider error. With `REPLAYS = 2` the script says whether the two episodes agree, so the
 determinism a given endpoint actually delivers is measured rather than assumed - hosted
 APIs do not promise bit-exact greedy decoding.
 
