@@ -33,7 +33,7 @@ from typing import Any, Sequence
 import pydantic_ai
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai import messages as M
-from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior, UsageLimitExceeded
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.wrapper import WrapperModel
@@ -117,8 +117,25 @@ class EpisodeConfig:
     value_precision: int | None = None
     system_prompt: str = SYSTEM_PROMPT
     user_prompt: str = USER_PROMPT
+    # Deployment, not behaviour - excluded from the fingerprint.
     provider_base_url: str | None = None
+    provider_anonymous: bool = False  # strip the Authorization header (keyless endpoints)
+    provider_timeout_s: float = 120.0
+    provider_max_retries: int = 0  # the OpenAI SDK's own quick retries; the harness retries below
+    request_interval_s: float = 0.0  # pacing between model requests, for rate-limited tiers
+    transient_retries: int = 8  # harness retries on HTTP 429 / 5xx, waiting for the provider's reset
+    rate_limit_wait_s: float = 35.0  # wait after a 429 when the provider names no reset time
     scripted_options: dict[str, Any] = field(default_factory=dict)
+
+    DEPLOYMENT_FIELDS = (
+        "provider_base_url",
+        "provider_anonymous",
+        "provider_timeout_s",
+        "provider_max_retries",
+        "request_interval_s",
+        "transient_retries",
+        "rate_limit_wait_s",
+    )
 
     def model_settings(self) -> ModelSettings | None:
         settings: dict[str, Any] = {}
@@ -159,7 +176,8 @@ class EpisodeConfig:
     def fingerprint(self) -> str:
         """Identity of the configuration - excludes the endpoint address, which is deployment, not behaviour."""
         payload = asdict(self)
-        payload.pop("provider_base_url")
+        for name in self.DEPLOYMENT_FIELDS:
+            payload.pop(name)
         if self.model != SCRIPTED:
             payload.pop("scripted_options")  # only the stand-in reads them
         payload["system_prompt"] = prompt_fingerprint(self.system_prompt)
@@ -179,22 +197,61 @@ class EpisodeResult:
         return self.run_end.usage
 
 
-class _RecordingModel(WrapperModel):
-    """Keeps every response the model returned, so one that pydantic-ai drops after a
-    usage limit trips can still be booked exactly (usage, details, verdict text)."""
+TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
-    def __init__(self, wrapped: Model):
+
+class _RecordingModel(WrapperModel):
+    """Two jobs around the real model.
+
+    It keeps every response the model returned, so one that pydantic-ai drops after a
+    usage limit trips can still be booked exactly (usage, details, verdict text). And it
+    absorbs transient HTTP failures - a 429 from a rate-limited tier, a 5xx - by waiting
+    and asking again, with the wait taken from the provider's reset headers when it sends
+    them, so the episode sees one slow request instead of a ``model_error``.
+    """
+
+    def __init__(self, wrapped: Model, *, transient_retries: int = 0, rate_limit_wait_s: float = 35.0, server_error_wait_s: float = 10.0):
         super().__init__(wrapped)
         self.last_response: M.ModelResponse | None = None
         self.responses = 0
+        self.transient_retries = transient_retries
+        self.rate_limit_wait_s = rate_limit_wait_s
+        self.server_error_wait_s = server_error_wait_s
+        self.transient_failures = 0
 
     async def request(
         self, messages: list[M.ModelMessage], model_settings: ModelSettings | None, model_request_parameters: ModelRequestParameters
     ) -> M.ModelResponse:
-        response = await super().request(messages, model_settings, model_request_parameters)
+        attempt = 0
+        while True:
+            try:
+                response = await super().request(messages, model_settings, model_request_parameters)
+                break
+            except ModelHTTPError as exc:
+                if exc.status_code not in TRANSIENT_HTTP_STATUSES or attempt >= self.transient_retries:
+                    raise
+                attempt += 1
+                self.transient_failures += 1
+                wait = _retry_wait_seconds(exc, default=self.rate_limit_wait_s if exc.status_code == 429 else self.server_error_wait_s)
+                logger.warning("HTTP %d from the model endpoint; waiting %.0fs before retry %d/%d", exc.status_code, wait, attempt, self.transient_retries)
+                await asyncio.sleep(wait)
         self.last_response = response
         self.responses += 1
         return response
+
+
+def _retry_wait_seconds(exc: ModelHTTPError, *, default: float) -> float:
+    """The provider's own advice on when to come back, else ``default``; never less than 1 s."""
+    headers = {str(k).lower(): str(v) for k, v in (getattr(exc, "headers", None) or {}).items()}
+    for key in ("retry-after", "ratelimit-reset", "x-ratelimit-reset"):
+        value = headers.get(key)
+        if value is None:
+            continue
+        try:
+            return max(1.0, float(value) + 2.0)
+        except ValueError:
+            continue
+    return max(1.0, default)
 
 
 # --- the episode ------------------------------------------------------------------------
@@ -229,8 +286,16 @@ async def run_episode_async(
     files = {name: output_dir / name for name in (VERDICTS_FILE, TRACE_FILE, MESSAGES_FILE, SUMMARY_FILE)}
 
     if model is None:
-        model = build_model(config.model, base_url=config.provider_base_url, api_key=api_key, scripted_options=config.scripted_options)
-    recording = _RecordingModel(model)
+        model = build_model(
+            config.model,
+            base_url=config.provider_base_url,
+            api_key=api_key,
+            anonymous=config.provider_anonymous,
+            timeout_s=config.provider_timeout_s,
+            max_retries=config.provider_max_retries,
+            scripted_options=config.scripted_options,
+        )
+    recording = _RecordingModel(model, transient_retries=config.transient_retries, rate_limit_wait_s=config.rate_limit_wait_s)
     agent = build_agent(
         recording,
         model_settings=config.model_settings(),
@@ -339,6 +404,7 @@ async def _drive(
     termination = Termination(reason="completed")
     run: Any = None
     pending: dict[str, Any] | None = None  # timing of the request in flight
+    last_request_at: float | None = None
 
     def _record_response(response: M.ModelResponse, *, started_at: str, duration_ms: float, retry_kind: RetryKind | None, history_chars: int) -> ModelRequestRecord:
         text = "\n".join(p.content for p in response.parts if isinstance(p, M.TextPart))
@@ -387,6 +453,11 @@ async def _drive(
                         history = list(run.all_messages())
                         if not history or history[-1] is not node.request:
                             history.append(node.request)
+                        if config.request_interval_s > 0 and last_request_at is not None:
+                            wait = config.request_interval_s - (time.perf_counter() - last_request_at)
+                            if wait > 0:
+                                await asyncio.sleep(wait)
+                        last_request_at = time.perf_counter()
                         pending = {
                             "retry_kind": _retry_kind(node.request.parts),
                             "history_chars": history_chars(history, instructions=config.system_prompt),

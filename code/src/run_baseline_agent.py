@@ -74,8 +74,22 @@ ALIAS_SERIES_IDS = False          # True: the agent sees opaque ids (s0001, ...)
 # pydantic-ai model string works for harness checks. "scripted" = dry run without an LLM.
 MODEL = "scripted"
 MODEL_BASE_URL = None             # OpenAI-compatible endpoint, e.g. "http://localhost:8000/v1"
+                                  # or the keyless OVHcloud tier
+                                  # "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 MODEL_API_KEY_ENV = "OPENAI_API_KEY"   # environment variable read for MODEL_BASE_URL endpoints
                                   # (provider strings use their own: OPENROUTER_API_KEY, ...)
+MODEL_API_KEY_FILE = None         # or a file holding the key, e.g. _REPO.parent / "zai_api_key.txt";
+                                  # keep it outside the repository - it wins over the variable
+MODEL_ANONYMOUS = False           # True: send no Authorization header at all (keyless tiers
+                                  # such as OVHcloud reject a placeholder bearer token)
+REQUEST_INTERVAL_S = 0.0          # minimum seconds between model requests; 31 keeps a
+                                  # 2-requests-per-minute tier happy
+PROVIDER_TIMEOUT_S = 180.0        # HTTP timeout per request (long contexts take a while)
+PROVIDER_MAX_RETRIES = 0          # the OpenAI SDK's quick retries; keep at 0 on tiers where
+                                  # rejected requests count against the window
+TRANSIENT_RETRIES = 8             # harness retries on 429 / 5xx, waiting for the reset the
+                                  # provider announces (RATE_LIMIT_WAIT_S when it does not)
+RATE_LIMIT_WAIT_S = 35.0
 SCRIPTED_OPTIONS = {"max_series": 25}  # stand-in knobs; ignored for real models
 
 # --- Decoding (FR7: greedy, seeded, one tool call per turn) ---
@@ -158,6 +172,12 @@ def build_config() -> EpisodeConfig:
         enforce_verdicts=ENFORCE_VERDICTS,
         value_precision=VALUE_PRECISION,
         provider_base_url=MODEL_BASE_URL,
+        provider_anonymous=MODEL_ANONYMOUS,
+        provider_timeout_s=PROVIDER_TIMEOUT_S,
+        provider_max_retries=PROVIDER_MAX_RETRIES,
+        request_interval_s=REQUEST_INTERVAL_S,
+        transient_retries=TRANSIENT_RETRIES,
+        rate_limit_wait_s=RATE_LIMIT_WAIT_S,
         scripted_options=dict(SCRIPTED_OPTIONS),
     )
 
@@ -173,10 +193,23 @@ def run_name(pool: Pool) -> str:
     return "_".join(parts) + "__" + model_slug(MODEL)
 
 
+def api_key_for_endpoint() -> str | None:
+    if not MODEL_BASE_URL or MODEL_ANONYMOUS:
+        return None
+    if MODEL_API_KEY_FILE:
+        key = Path(MODEL_API_KEY_FILE).read_text(encoding="utf-8").strip()
+        if not key:
+            raise ValueError(f"{MODEL_API_KEY_FILE} is empty")
+        return key
+    return os.environ.get(MODEL_API_KEY_ENV)
+
+
 def main() -> int:
     pool = load_pool()
     config = build_config()
-    api_key = os.environ.get(MODEL_API_KEY_ENV) if MODEL_BASE_URL else None
+    api_key = api_key_for_endpoint()
+    if MODEL_BASE_URL and not MODEL_ANONYMOUS and not api_key:
+        logger.warning("no API key found (%s / %s); the endpoint will be called without credentials", MODEL_API_KEY_FILE, MODEL_API_KEY_ENV)
     name = run_name(pool)
     results = []
     exit_code = 0

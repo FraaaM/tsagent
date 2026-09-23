@@ -296,6 +296,39 @@ class TestAgentWrappers:
         assert once.get(once.series_ids[0]) is tiny_pool.get(once.series_ids[0])
 
 
+class TestModelResolution:
+    def test_openai_compatible_endpoint_with_and_without_credentials(self):
+        from pydantic_ai.models.openai import OpenAIChatModel
+
+        from src.baseline_agent.models import build_model
+
+        model = build_model("openai-chat:gpt-oss-20b", base_url="http://localhost:1/v1", api_key="k", timeout_s=7.0, max_retries=2)
+        assert isinstance(model, OpenAIChatModel) and model.model_name == "gpt-oss-20b"
+        assert str(model.client.base_url).startswith("http://localhost:1/v1") and model.client.max_retries == 2
+        anonymous = build_model("gpt-oss-20b", base_url="http://localhost:1/v1", anonymous=True)
+        assert isinstance(anonymous, OpenAIChatModel) and anonymous.model_name == "gpt-oss-20b"
+
+    def test_anonymous_client_strips_the_authorization_header(self):
+        import asyncio
+
+        import httpx
+
+        from src.baseline_agent.models import anonymous_http_client
+
+        seen: list[dict[str, str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(dict(request.headers))
+            return httpx.Response(200, json={"ok": True})
+
+        async def go():
+            async with anonymous_http_client(5.0, transport=httpx.MockTransport(handler)) as client:
+                await client.get("http://x/v1/models", headers={"Authorization": "Bearer unused", "X-Other": "kept"})
+
+        asyncio.run(go())
+        assert seen and "authorization" not in seen[0] and seen[0]["x-other"] == "kept"
+
+
 class TestIdViews:
     def test_plain_ids_resolve_exact_then_trimmed(self, tiny_pool):
         ids = PlainIds(tiny_pool.series_ids)

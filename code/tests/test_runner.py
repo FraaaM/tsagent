@@ -176,6 +176,18 @@ class TestHappyPath:
         c = run(tiny_pool.subset(tiny_pool.series_ids[:3]), tmp_path, "c")
         d = run(tiny_pool, tmp_path, "d", order_seed=1)
         assert len({a.run_id, b.run_id, c.run_id, d.run_id}) == 4
+        # deployment knobs change where and how fast the model is reached, not what the run is
+        deployed = config(provider_base_url="http://x", provider_anonymous=True, request_interval_s=9.0, provider_max_retries=1)
+        assert deployed.fingerprint() == config().fingerprint()
+
+    def test_request_pacing_spaces_model_requests(self, tiny_pool, tmp_path):
+        import time
+
+        t0 = time.perf_counter()
+        result = run(tiny_pool, tmp_path, request_interval_s=0.05)
+        elapsed = time.perf_counter() - t0
+        end = trace_of(result)[-1]
+        assert end.requests == 7 and elapsed >= 0.05 * 6
 
     def test_run_start_records_the_configuration(self, tiny_pool, tmp_path):
         seen: list[AgentInfo] = []
@@ -289,6 +301,30 @@ class TestTermination:
         assert end.series.verdicted == 1 and end.series.examined_without_verdict == 0
         assert [v.verdict for v in validate_verdicts_file(result.files[VERDICTS_FILE])] == ["anomalous"]
         assert sum(m["kind"] == "response" for m in messages_of(result)) == 3
+
+    def test_transient_http_errors_are_retried_then_given_up(self, tiny_pool, tmp_path):
+        inner = ScriptedPolicy()
+        calls = {"n": 0}
+
+        def rate_limited(messages, info):
+            calls["n"] += 1
+            if calls["n"] in (2, 3):  # two 429s in a row on the second request
+                raise ModelHTTPError(status_code=429, model_name="tier", body={"message": "API rate limit exceeded"})
+            if calls["n"] == 5:
+                raise ModelHTTPError(status_code=503, model_name="tier", body="busy")
+            return inner(messages, info)
+
+        cfg = config(model="tier", transient_retries=3, rate_limit_wait_s=0.01)
+        result = run_episode(tiny_pool, cfg, tmp_path / "t", model=FunctionModel(rate_limited))
+        end = trace_of(result)[-1]
+        assert end.termination.reason == "completed" and end.requests == 7 and calls["n"] == 10
+        assert end.series.verdicted == 5
+
+        calls["n"] = 0
+        cfg = config(model="tier", transient_retries=1, rate_limit_wait_s=0.01)
+        result = run_episode(tiny_pool, cfg, tmp_path / "u", model=FunctionModel(rate_limited))
+        end = trace_of(result)[-1]
+        assert end.termination.reason == "model_error" and "429" in (end.termination.detail or "")
 
     def test_model_error_is_recorded_and_outputs_survive(self, tiny_pool, tmp_path):
         inner = ScriptedPolicy()
