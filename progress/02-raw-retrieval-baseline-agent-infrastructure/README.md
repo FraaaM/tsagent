@@ -202,7 +202,9 @@ exhausted by the missing-verdict check, tool-argument retries exhausted, or a re
 truncated before it produced anything) or `interrupted` (Ctrl-C or task cancellation).
 Whatever the reason, the trace is closed by `run_end` and the verdicts file holds every
 verdict accepted up to that point. `run_end.retries` counts retry prompts by kind: `output`
-for the missing-verdict nudge, `tool` for invalid tool arguments and unknown tool names.
+for the missing-verdict nudge and for pydantic-ai's own retry when a reply carried nothing
+but reasoning, `tool` for invalid tool arguments and unknown tool names, `closing` for the
+closing turn after a budget stop.
 
 **`messages.json`** - the conversation as pydantic-ai kept it, tool payloads included: the
 ground truth for anything about context. **`summary.json`** - the `run_end` record plus
@@ -392,11 +394,21 @@ requests. The id list alone made the second request 53.6k tokens; the model pick
 `R1__WSD__WSD_90_chunk0` ("let's pick a manageable one"), a 4,320-point series whose
 payload took the third request to 86.7k tokens, judged it `anomalous` on a "quick glance"
 - a spike "at index 4000" in a series the labels call normal - and stopped. Termination
-`completed`, 1 of 2,900 series examined and judged, 141.7k tokens, 206 s. That is the
-raw-retrieval baseline on a real pool: within the constitution's daily budget it covers
-one series, and the trace says exactly where the tokens went (a third of them to the id
-list). The verdicts, traces and summaries of these runs are kept under
-[`results/`](results/) (messages files with the raw payloads are not).
+`completed`, 1 of 2,900 series examined and judged, 141.7k tokens, 206 s.
+
+**Full R2 run** (same configuration): four requests. The id list is 38.9k tokens here;
+the model retrieved `R2__SVDB__874_col_1_chunk17` (1,520 points, label 1), answered with
+10,935 tokens of reasoning and no text - pydantic-ai's own "return text or call a tool"
+retry followed - and then judged it `anomalous`, citing the rise from 0.04 to 2.585 over
+six samples, which is the QRS complex of every heartbeat in the record. A true positive
+with an ECG's normal feature as the evidence. Termination `completed`, 1 of 2,900 series,
+148.4k tokens, 724 s.
+
+That is the raw-retrieval baseline on real pools: within the constitution's daily budget
+it covers one series per episode, and the trace says exactly where the tokens went - a
+quarter to a third of them to the id list, the rest to one payload sent twice. The
+verdicts, traces and summaries of these runs are kept under [`results/`](results/)
+(messages files with the raw payloads are not).
 
 ## What to expect from a full run
 
