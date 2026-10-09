@@ -135,10 +135,19 @@ def resolve_pool_file() -> Path:
     raise FileNotFoundError(f"no pool directory found; tried {[str(p) for p in _DATA_DIRS]} - run `dvc pull` first")
 
 
+def source_label(pool_file: Path) -> str:
+    """The pool path as the trace records it: relative to the repository when the file lies
+    inside it, so replays from different checkouts compare equal."""
+    try:
+        return pool_file.resolve().relative_to(_REPO).as_posix()
+    except ValueError:
+        return str(pool_file)
+
+
 def load_pool() -> Pool:
     pool_file = resolve_pool_file()
     logger.info("loading pool %s", pool_file)
-    pool = Pool.from_parquet(pool_file)
+    pool = Pool.from_parquet(pool_file, source=source_label(pool_file))
     if SPLIT:
         meta = pool_file.with_name(f"{pool_file.stem}_metadata.parquet")
         pool = pool.subset(read_split_ids(meta, SPLIT))

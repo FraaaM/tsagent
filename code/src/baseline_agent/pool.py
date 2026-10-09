@@ -129,8 +129,12 @@ class Pool:
         return cls(name, series, source=source)
 
     @classmethod
-    def from_parquet(cls, path: str | Path, *, name: str | None = None) -> "Pool":
-        """Load a spec-01 pool, reading only the three columns the agent may see."""
+    def from_parquet(cls, path: str | Path, *, name: str | None = None, source: str | None = None) -> "Pool":
+        """Load a spec-01 pool, reading only the three columns the agent may see.
+
+        ``source`` is what the trace records as the pool's path; it defaults to ``path``
+        as given.
+        """
         path = Path(path)
         if not path.is_file():
             raise FileNotFoundError(f"pool file not found: {path}")
@@ -139,7 +143,7 @@ class Pool:
         if missing:
             raise ValueError(f"{path}: lacks required column(s) {missing}; has {present}")
         table = pq.read_table(path, columns=list(REQUIRED_COLUMNS))
-        return cls.from_frame(table.to_pandas(), name or path.stem, source=str(path))
+        return cls.from_frame(table.to_pandas(), name or path.stem, source=str(path) if source is None else source)
 
     # --- access -----------------------------------------------------------------------
 
