@@ -34,17 +34,18 @@ how to run it and what to expect from it.
 - [x] Unit tests, no LLM and no GPU (spec §3, unit level): tool registration and the
       settings the model receives, tool behaviour, strict output schemas, and whole episodes
       driven by a scripted stand-in model through every termination path -
-      [`code/tests/`](../../code/tests/), 92 tests.
+      [`code/tests/`](../../code/tests/), 100 tests.
 - [x] Dry runs on the real R1 pool with the stand-in: pipeline, trace consistency and
       replay identity hold on real data; [`src/measure_payloads.py`](src/measure_payloads.py)
       reproduces the context arithmetic below.
 - [x] End-to-end runs with an LLM (spec §3, E2E level) on a free endpoint, gpt-oss-20b
-      through OVHcloud's anonymous tier: replay pairs and a full R1 run - see
+      through OVHcloud's anonymous tier: replay pairs and full R1 and R2 runs - see
       [End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints). The
       harness behaves as designed; the endpoint does not replay deterministically, and the
       model examines one to three series per episode.
-- [ ] The same runs on a second endpoint (Z.AI's free GLM-4.7-Flash, key pending) and, once
-      the supervisor's key is available, on enough of R1/R2 to characterise coverage.
+- [ ] The same checks on a locally served model with a fixed batch size, where the FR7
+      replay can be verified end to end, and enough episodes per pool to characterise
+      coverage beyond a single run.
 
 ## Layout
 
@@ -138,8 +139,9 @@ MODEL = "openrouter:openai/gpt-oss-20b"    # OPENROUTER_API_KEY
 MODEL = "anthropic:claude-sonnet-4-5"      # ANTHROPIC_API_KEY - harness checks only, out of the 20B constraint
 ```
 
-Free tiers work through the same `MODEL_BASE_URL` path. Two of them were tried (see
-[End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints)):
+Free tiers work through the same `MODEL_BASE_URL` path. The keyless OVHcloud tier served
+the runs in [End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints);
+Z.AI's free GLM flash models are wired the same way and need a key:
 
 ```python
 # OVHcloud AI Endpoints, anonymous: no key, 2 requests per minute per IP, and a rejected
@@ -186,7 +188,7 @@ always in the pool's own ids:
 
 | `kind` | One per | Carries |
 |--------|---------|---------|
-| `run_start` | run | run id, pool (name, path, size, fingerprint), order seed, aliasing flag, model and settings, caps, prompt hash, registered tools, harness versions |
+| `run_start` | run | run id, pool (name, repository-relative path, size, fingerprint), order seed, aliasing flag, model and settings, caps, prompt hash, registered tools, harness versions |
 | `model_request` | LLM round trip | index, retry kind (`tool` / `output` / none), wall time, provider usage (input / output / cache tokens, details), context size in characters, tool calls requested, verdicts accepted / rejected |
 | `tool_call` | tool invocation | tool, arguments as sent, resolved series id, ok or error text, points returned, payload size, wall time |
 | `verdict` | parsed verdict | series id, verdict, whether the series was examined, accepted or the rejection reason, whether it superseded an earlier one, normalisation notes |
@@ -438,8 +440,8 @@ has consumed roughly 52.6k × (k+1) + 14.2k × k(k+1)/2:
 
 The dry run with the stand-in (4 characters per token, so optimistic) on R1 with
 `ORDER_SEED = 42` ended with reason `budget` after 13 requests: 11 series retrieved, all 11
-judged, 905,750 estimated tokens spent, the 12th retrieval refused because the projection
-reached 1.06M. With aliasing on it managed 14 series in 16 requests for 966,295. Both
+judged, 906,634 estimated tokens spent, the 12th retrieval refused because the projection
+reached 1.06M. With aliasing on it managed 14 series in 16 requests for 967,383. Both
 replay identically.
 
 So on this baseline "a full run over one real dataset" is a run that terminates cleanly
