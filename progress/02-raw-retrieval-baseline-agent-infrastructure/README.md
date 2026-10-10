@@ -364,6 +364,20 @@ seed 42, `reasoning_effort = "low"`, `MAX_TOKENS = 32768`, `CONTEXT_TOKENS_LIMIT
 [`results/`](results/) (`messages.json` with the raw payloads is not);
 `src/summarize_run.py` prints the numbers below from a run directory.
 
+The runs with opaque ids at a glance (gpt-oss-20b on OVHcloud, GLM-4.7-Flash on Z.AI's
+free tier; the details follow):
+
+| Run | Model | Requests | Series retrieved / judged | Termination | Tokens | Wall | Against the labels |
+|-----|-------|----------|---------------------------|-------------|--------|------|--------------------|
+| full R1 | gpt-oss-20b | 3 | 1 / 1 | `completed` | 59.3k | 141 s | 1 false positive |
+| full R2 | gpt-oss-20b | 3 | 1 / 1 | `completed` | 35.9k | 128 s | 1 miss |
+| dev-5, episode 1 | gpt-oss-20b | 6 | 3 / 3 | `completed` | 150.5k | 322 s | 3 correct `normal` |
+| dev-5, episode 2 | gpt-oss-20b | 4 | 1 / 1 | `completed` | 28.0k | 245 s | 1 false positive |
+| full R1 | GLM-4.7-Flash | 3 | 4 / 4 | `budget` | 134.8k | 118 s | 4 correct `normal` |
+| full R2 | GLM-4.7-Flash | 4 | 10 / 10 | `budget` | 246.7k | 634 s | 1 hit, 4 misses, 5 correct `normal` |
+| dev-5, episode 1 | GLM-4.7-Flash | 5 | 4 / 3 | `model_error` (429) | 111.4k | 1,008 s | 2 false positives, 1 correct `normal` |
+| dev-5, episode 2 | GLM-4.7-Flash | 5 | 4 / 3 | `model_error` (500) | 115.2k | 1,432 s | 1 false positive, 2 correct `normal` |
+
 **Full R1 run**: three requests. The id list brings the second request to 12.6k tokens
 (53.6k with the pool's own ids); the model decides to "pick few", takes the first served
 id - `s0001`, which is `R1__WSD__WSD_90_chunk1`, 4,320 points, 33k tokens of payload -
