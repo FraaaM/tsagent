@@ -491,9 +491,13 @@ async def _drive(
                     has_tool_calls = any(isinstance(p, M.ToolCallPart) for p in response.parts)
                     if has_tool_calls and not execute_tools:
                         return None, response
-                    stop = _budget_stop(record, response, deps, config)
+                    stop, refused = _admit_calls(record, response, deps, config)
                     if stop is not None:
                         return stop, response
+                    if refused:
+                        deps.refused_call_ids.update(p.tool_call_id for p in refused)
+                        asked = sum(1 for p in response.parts if isinstance(p, M.ToolCallPart) and p.tool_name == "get_series")
+                        logger.info("request %d asked for %d retrievals; %d admitted, %d refused (they would not fit)", request_index, asked, asked - len(refused), len(refused))
                 pending = None
                 node = next_node
             elif Agent.is_call_tools_node(node):
@@ -608,48 +612,65 @@ def closing_prompt(owed_ids: Sequence[str], *, max_ids: int = 20) -> str:
 # --- budget projection ------------------------------------------------------------------
 
 
-def _budget_stop(record: ModelRequestRecord, response: M.ModelResponse, deps: EpisodeDeps, config: EpisodeConfig) -> Termination | None:
-    """Decide, before any tool of ``response`` runs, whether the request that would follow
-    it fits the budget. pydantic-ai checks token limits after a response has been paid for
-    - and the request after a retrieval is the expensive one - so the projection here is
-    what keeps a capped run under its cap and free of retrieved-but-unjudged series."""
+def _admit_calls(record: ModelRequestRecord, response: M.ModelResponse, deps: EpisodeDeps, config: EpisodeConfig) -> tuple[Termination | None, list[M.ToolCallPart]]:
+    """Decide, before any tool of ``response`` runs, which of its retrievals the request that
+    would follow can afford. pydantic-ai checks token limits after a response has been paid
+    for - and the request after a retrieval is the expensive one - so the projection here
+    is what keeps a capped run under its cap and free of retrieved-but-unjudged series.
+
+    Retrievals are admitted in issue order while the projection fits; the rest of the turn
+    is refused, and the tool answers each refused call with ``not_admitted_error`` so the
+    model reads why. A turn whose first retrieval does not fit is a budget stop."""
     tool_parts = [p for p in response.parts if isinstance(p, M.ToolCallPart)]
     if not tool_parts or (config.total_tokens_limit is None and config.context_tokens_limit is None):
-        return None
+        return None, []
     cpt = config.chars_per_token_estimate
     context = record.usage.input_tokens if record.usage.input_tokens > 0 else math.ceil(record.history_chars / cpt)
-    payload_chars = 0
-    requested: list[str] = []
+    allowance = config.max_tokens if config.max_tokens is not None else config.output_allowance_tokens
+    spent = deps.recorder.total_tokens()
+
+    def over(payload_chars: int) -> str | None:
+        payload_tokens = math.ceil(payload_chars / cpt)
+        next_input = context + record.usage.output_tokens + payload_tokens
+        breakdown = f"context {context:,} + response {record.usage.output_tokens:,} + requested payloads ~{payload_tokens:,}"
+        if config.context_tokens_limit is not None and next_input + allowance > config.context_tokens_limit:
+            return (
+                f"the next request would need about {next_input:,} input tokens ({breakdown}) plus {allowance:,} for the reply, "
+                f"over context_tokens_limit={config.context_tokens_limit:,}"
+            )
+        projected = spent + next_input + allowance
+        if config.total_tokens_limit is not None and projected > config.total_tokens_limit:
+            return (
+                f"the next request would bring the episode to about {projected:,} tokens ({spent:,} spent + {next_input:,} input [{breakdown}] "
+                f"+ {allowance:,} reply allowance), over total_tokens_limit={config.total_tokens_limit:,}"
+            )
+        return None
+
+    fixed = 0  # payloads of the calls that are always served: metadata, and anything that is not a retrieval
+    retrievals: list[tuple[M.ToolCallPart, str, int]] = []
     for part in tool_parts:
         if part.tool_name == "get_series":
             sid = _args_as_dict(part).get("series_id")
             real = deps.ids.resolve(sid) if isinstance(sid, str) else None
-            payload_chars += deps.payload_chars(real) if real is not None else 160
-            requested.append(str(sid))
+            retrievals.append((part, str(sid), deps.payload_chars(real) if real is not None else 160))
         elif part.tool_name == "get_pool_meta_data":
-            payload_chars += deps.meta_chars()
+            fixed += deps.meta_chars()
         else:
-            payload_chars += 160
-    payload_tokens = math.ceil(payload_chars / cpt)
-    next_input = context + record.usage.output_tokens + payload_tokens
-    allowance = config.max_tokens if config.max_tokens is not None else config.output_allowance_tokens
-    breakdown = f"context {context:,} + response {record.usage.output_tokens:,} + requested payloads ~{payload_tokens:,}"
-    if config.context_tokens_limit is not None and next_input + allowance > config.context_tokens_limit:
-        return Termination(
-            reason="budget",
-            detail=f"the next request would need about {next_input:,} input tokens ({breakdown}) plus {allowance:,} for the reply, "
-            f"over context_tokens_limit={config.context_tokens_limit:,}; not fetched: {requested}",
-        )
-    spent = deps.recorder.total_tokens()
-    projected = spent + next_input + allowance
-    if config.total_tokens_limit is not None and projected > config.total_tokens_limit:
-        return Termination(
-            reason="budget",
-            detail=f"the next request would bring the episode to about {projected:,} tokens ({spent:,} spent + {next_input:,} input [{breakdown}] "
-            f"+ {allowance:,} reply allowance), over total_tokens_limit={config.total_tokens_limit:,}; not fetched: {requested}",
-        )
-    return None
-
+            fixed += 160
+    if not retrievals:
+        reason = over(fixed)
+        return (Termination(reason="budget", detail=f"{reason}; not fetched: []") if reason else None), []
+    admitted = 0
+    refused: list[M.ToolCallPart] = []
+    for part, _sid, chars in retrievals:
+        if refused or over(fixed + admitted + chars) is not None:
+            refused.append(part)
+        else:
+            admitted += chars
+    if len(refused) == len(retrievals):
+        reason = over(fixed + sum(chars for _, _, chars in retrievals))
+        return Termination(reason="budget", detail=f"{reason}; not fetched: {[sid for _, sid, _ in retrievals]}"), []
+    return None, refused
 
 # --- helpers ----------------------------------------------------------------------------
 

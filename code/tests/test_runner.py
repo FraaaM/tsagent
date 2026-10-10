@@ -36,6 +36,7 @@ from src.baseline_agent.schemas import (
     validate_verdicts_file,
 )
 from src.baseline_agent.scripted import ScriptedPolicy
+from src.baseline_agent.tools import get_series
 
 
 def config(**overrides) -> EpisodeConfig:
@@ -323,6 +324,34 @@ class TestTermination:
         end = trace_of(result)[-1]
         assert end.termination.reason == "budget" and "context_tokens_limit" in (end.termination.detail or "")
         assert end.series.examined_without_verdict == 0 and end.series.examined >= 1
+
+    def test_batch_beyond_the_window_is_served_in_issue_order(self, tiny_pool, tmp_path):
+        ids = tiny_pool.series_ids
+        sizes = [len(get_series(tiny_pool, s)) for s in ids]
+
+        def batching(messages, info):
+            last = messages[-1].parts
+            if any(isinstance(p, M.UserPromptPart) for p in last):
+                return M.ModelResponse(parts=[M.ToolCallPart("get_pool_meta_data", {})], usage=usage())
+            if any(isinstance(p, M.ToolReturnPart) and p.tool_name == "get_pool_meta_data" for p in last):
+                return M.ModelResponse(parts=[M.ToolCallPart("get_series", {"series_id": s}) for s in ids], usage=usage())
+            served = [json.loads(p.content)["series_id"] for p in last if isinstance(p, M.ToolReturnPart) and not p.content.startswith("Error")]
+            lines = [json.dumps({"series_id": s, "verdict": "normal"}) for s in served]
+            return M.ModelResponse(parts=[M.TextPart("\n".join(lines + [f"DONE {len(served)}"]))], usage=usage())
+
+        # usage() reports one input and one output token; at one character per token the request
+        # after the batch needs 2 + payload tokens, so this window admits exactly two series.
+        cfg = config(model="batching", alias_series_ids=False, context_tokens_limit=2 + sizes[0] + sizes[1] + 10, chars_per_token_estimate=1.0, output_allowance_tokens=10)
+        result = run_episode(tiny_pool, cfg, tmp_path / "batch", model=FunctionModel(batching))
+        records = trace_of(result)
+        end = records[-1]
+        calls = [c for c in by_kind(records, ToolCallRecord) if c.tool_name == "get_series"]
+        assert [c.ok for c in calls] == [True, True, False, False, False]
+        assert all("not retrieved" in (c.error or "") and c.series_id in (c.error or "") for c in calls[2:])
+        assert end.termination.reason == "completed" and end.tool_calls.failed == 3 and end.tool_calls.get_series == 5
+        assert end.series.examined == 2 and [v.series_id for v in validate_verdicts_file(result.files[VERDICTS_FILE])] == ids[:2]
+        returns = [p for m in messages_of(result) for p in m["parts"] if p.get("part_kind") == "tool-return" and p.get("tool_name") == "get_series"]
+        assert [p["content"].startswith("Error: not retrieved") for p in returns] == [False, False, True, True, True]
 
     def test_token_limit_after_a_response_keeps_that_response(self, tiny_pool, tmp_path):
         sid = tiny_pool.series_ids[0]

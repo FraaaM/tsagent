@@ -104,8 +104,10 @@ EXTRA_MODEL_SETTINGS = {}         # provider-specific pydantic-ai settings, e.g.
 
 # --- Episode caps ---
 # pydantic-ai checks these after each response; the harness additionally projects the
-# next request from the payloads the model just asked for and stops *before* it when the
-# projection breaks TOTAL_TOKENS_LIMIT or CONTEXT_TOKENS_LIMIT (termination "budget").
+# next request from the payloads the model just asked for: a turn's retrievals are served
+# in issue order while the projection fits, the rest get a textual error, and a turn whose
+# first retrieval breaks TOTAL_TOKENS_LIMIT or CONTEXT_TOKENS_LIMIT ends the episode
+# *before* fetching (termination "budget").
 REQUEST_LIMIT = None              # model requests per episode; None = 2 per series + 8
 TOOL_CALLS_LIMIT = None           # executed tool calls per episode; None = 2 per series + 8
 TOTAL_TOKENS_LIMIT = 1_000_000    # constitution budget: about one day of API access

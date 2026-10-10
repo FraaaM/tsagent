@@ -40,6 +40,7 @@ class EpisodeDeps:
     ids: PlainIds | IdAliases | None = None
     value_precision: int | None = None
     enforce_verdicts: bool = True
+    refused_call_ids: set[str] = field(default_factory=set, repr=False)  # retrievals the budget projection did not admit
     _payload_chars: dict[str, int] = field(default_factory=dict, repr=False)
     _meta_chars: int | None = field(default=None, repr=False)
 
@@ -61,6 +62,15 @@ class EpisodeDeps:
         return self._meta_chars
 
 
+def not_admitted_error(series_id: str) -> str:
+    """The answer to a retrieval the budget projection did not admit: the calls issued before
+    it in the same turn were served, this one was not, and the model is told why."""
+    return (
+        f"Error: not retrieved - series '{series_id}' would not fit in the episode's remaining budget together with "
+        "the series requested before it in this turn. Request fewer series per turn."
+    )
+
+
 def get_series(ctx: RunContext[EpisodeDeps], series_id: str, **ignored: Any) -> str:
     """Return the full raw series with the given id.
 
@@ -79,7 +89,10 @@ def get_series(ctx: RunContext[EpisodeDeps], series_id: str, **ignored: Any) -> 
     with deps.recorder.tool_call(
         "get_series", ctx.tool_call_id, {"series_id": series_id, **ignored}, request_index=ctx.run_step, series_id=real if real is not None else series_id
     ) as call:
-        if real is None:
+        if ctx.tool_call_id in deps.refused_call_ids:
+            text = not_admitted_error(series_id)
+            call.finish(text)
+        elif real is None:
             # Only names the model was given resolve; with aliasing on, a pool id it may
             # have guessed from elsewhere is not one of them and the pool is never consulted.
             text = unknown_id_error(series_id) if series_id.strip() else _get_series(deps.pool, series_id)
