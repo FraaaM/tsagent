@@ -39,7 +39,8 @@ how to run it and what to expect from it.
       replay identity hold on real data; [`src/measure_payloads.py`](src/measure_payloads.py)
       reproduces the context arithmetic below.
 - [x] End-to-end runs with an LLM (spec §3, E2E level) on a free endpoint, gpt-oss-20b
-      through OVHcloud's anonymous tier: replay pairs and full R1 and R2 runs - see
+      through OVHcloud's anonymous tier: replay pairs and full R1 and R2 runs, with opaque
+      ids and, before the switch, with the pool's own - see
       [End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints). The
       harness behaves as designed; the endpoint does not replay deterministically, and the
       model examines one to three series per episode.
@@ -53,7 +54,7 @@ how to run it and what to expect from it.
 code/src/baseline_agent/
   pool.py        Pool: label-free view of a spec-01 parquet file, seeded reordering
   tools.py       get_series / get_pool_meta_data as pure functions returning text
-  ids.py         the ids the model sees: the pool's own, or opaque aliases (off by default)
+  ids.py         the ids the model sees: opaque aliases by default, or the pool's own
   prompt.py      system prompt (task, verdict format, budget rule, stop rule), user prompt
   agent.py       pydantic-ai Agent: the two tools with timing/trace wrappers, output check
   verdicts.py    verdict-line parser and the episode rules (examined-only, last wins)
@@ -67,7 +68,7 @@ code/src/run_baseline_agent.py   configuration-driven entry point
 code/tests/                      test_tools.py, test_output_schemas.py, test_runner.py
 src/measure_payloads.py          payload and token measurements behind the table below
 src/summarize_run.py             coverage, cost, termination and label read-out of runs
-results/<run>/                   verdicts, trace and summary of the real-model runs
+results/<run>/                   verdicts, trace, summary and alias map of the real-model runs
 (full runs, messages.json included, land in
  ../../data/02-raw-retrieval-baseline-agent-infrastructure/runs/, git-ignored)
 ```
@@ -92,7 +93,7 @@ python code/src/run_baseline_agent.py
 The defaults make a **dry run**: `MODEL = "scripted"` replaces the LLM with a
 deterministic stand-in that walks the served order of R1, retrieves each series once,
 judges it with a fixed rule and moves on, until the budget projection stops the episode
-(11 series with the default 1M-token cap; its token counts are estimates, see below). It
+(14 series with the default 1M-token cap; its token counts are estimates, see below). It
 exercises everything except the model and needs no API. Its verdicts say nothing about
 anomaly detection.
 
@@ -102,7 +103,7 @@ Useful knobs:
 |------|---------|
 | `POOL_FILE`, `SPLIT`, `SERIES_LIMIT` | which pool, optionally one split (`dev`/`test`) or the first N series of the served order |
 | `ORDER_SEED` | seeded permutation of the order the agent is shown (`None` = file order) |
-| `ALIAS_SERIES_IDS` | show the agent opaque ids instead of the provenance-carrying spec-01 ids (off by default) |
+| `ALIAS_SERIES_IDS` | on by default: the agent sees opaque ids instead of the provenance-carrying spec-01 ids; `False` serves the pool's ids as they are and marks the run name with `plainids` |
 | `MODEL`, `MODEL_BASE_URL`, `MODEL_API_KEY_ENV` / `MODEL_API_KEY_FILE`, `MODEL_ANONYMOUS` | which LLM, where, and how to authenticate (see below) |
 | `REQUEST_INTERVAL_S`, `TRANSIENT_RETRIES`, `RATE_LIMIT_WAIT_S` | pacing for rate-limited tiers, and how long the harness keeps retrying 429 / 5xx answers |
 | `TEMPERATURE = 0.0`, `SEED = 42`, `PARALLEL_TOOL_CALLS = False` | greedy, seeded decoding, one retrieval per turn (FR7, idea B) |
@@ -172,7 +173,7 @@ APIs do not promise bit-exact greedy decoding.
 ## Outputs
 
 One directory per run, `OUTPUT_DIR / RUN_NAME` (default
-`<pool>[_<split>][_first<N>]__<model slug>`, replays get a `__replay<k>` suffix):
+`<pool>[_<split>][_first<N>][_plainids]__<model slug>`, replays get a `__replay<k>` suffix):
 
 **`anomaly_verdicts.jsonl`** (FR5) - one record per examined series, its standing verdict,
 always in the pool's own ids:
@@ -210,7 +211,7 @@ closing turn after a budget stop.
 
 **`messages.json`** - the conversation as pydantic-ai kept it, tool payloads included: the
 ground truth for anything about context. **`summary.json`** - the `run_end` record plus
-identifiers. **`series_aliases.json`** - alias to pool id, only when aliasing is on.
+identifiers. **`series_aliases.json`** - alias to pool id, absent only with `ALIAS_SERIES_IDS = False`.
 
 `baseline_agent.schemas.validate_verdicts_file` / `validate_trace_file` validate the two
 files strictly (types are checked, not coerced; the entry point runs both after every
@@ -272,19 +273,20 @@ unexecuted call as a failed `tool_call`, `run_end.retries.closing`). pydantic-ai
 caps stay on as the backstop, and if one of them does trip after a response, the response
 is still booked exactly: the model is wrapped so the harness keeps what pydantic-ai drops.
 
-**Label-free by construction, provenance by choice.** `Pool.from_parquet` reads
+**Label-free by construction, and no provenance in the ids.** `Pool.from_parquet` reads
 `series_id`, `time_index`, `value` and nothing else; the metadata file is opened only to
 select a split, and only its `series_id` / `split` columns; the prompt names no base rate,
-pool size or series length. What the tools do expose is the spec-01 id itself, and on R1
-its provenance predicts the label: YAHOO samples are 95% anomalous, NEK 100%, unsplit
-`_full` samples 96% against 23% for chunks (R2 is milder: 20-36% by source). An agent
-could therefore guess from the id without reading a value. `ALIAS_SERIES_IDS = True`
-replaces ids with opaque `s0001`-style names in both tools and in the retry message, maps
-them back for every output file and trace field, writes the mapping next to the outputs,
-and - as a side effect - cuts the `get_pool_meta_data` payload about five-fold. It is off
-by default because spec 02 defines the tools in terms of the pool's ids; turning it on is
-a decision for the RQ1 protocol, and whichever way it goes the tool-augmented agent must
-be served the same ids.
+pool size or series length. The spec-01 id itself would leak: on R1 its provenance
+predicts the label - YAHOO samples are 95% anomalous, NEK 100%, unsplit `_full` samples
+96% against 23% for chunks (R2 is milder: 20-36% by source) - so an agent could guess
+from the id without reading a value, and in the first runs with plain ids gpt-oss-20b
+visibly chose series by name ("maybe pick WSD series"). The model therefore sees opaque
+`s0001`-style names, numbered in served order, in both tools and in the retry message;
+every output file and trace field carries the pool's own ids, the mapping is written next
+to the outputs (`series_aliases.json`), and the `get_pool_meta_data` payload shrinks about
+five-fold as a side effect. `ALIAS_SERIES_IDS = False` serves the pool's ids as they are,
+for experiments on the leak itself, and marks the run name with `plainids`. Whichever ids
+the baseline sees, the tool-augmented agent of M2/M3 must be served the same.
 
 **Served order is a seed, not the file order.** Spec-01 files are grouped by source, so
 file order walks one recording at a time: the first 25 R1 series are consecutive Exathlon
@@ -343,74 +345,79 @@ tokenises at under 2 - and it is labelled `scripted` everywhere.
 The E2E checks of spec §3 were run on `gpt-oss-20b` served by OVHcloud's anonymous AI
 Endpoints tier (no key; 2 requests per minute per IP with rejected requests counted, so
 about one request per minute in practice; `parallel_tool_calls` unsupported;
-`reasoning_effort` supported). Configuration: `ORDER_SEED = 42`, temperature 0, seed 42,
-`MAX_TOKENS = 32768`, `CONTEXT_TOKENS_LIMIT = 131072`, `REQUEST_INTERVAL_S = 62`, no SDK
-retries, harness retries on 429 with the announced `retry-after`. Raw outputs are under
-`data/02-raw-retrieval-baseline-agent-infrastructure/runs/` (git-ignored);
-`src/summarize_run.py` prints the numbers below.
+`reasoning_effort` supported). Configuration: opaque ids, `ORDER_SEED = 42`, temperature 0,
+seed 42, `reasoning_effort = "low"`, `MAX_TOKENS = 32768`, `CONTEXT_TOKENS_LIMIT = 131072`,
+`REQUEST_INTERVAL_S = 62`, no SDK retries, harness retries on 429 with the announced
+`retry-after`. Verdicts, traces, summaries and alias maps are kept under
+[`results/`](results/) (`messages.json` with the raw payloads is not);
+`src/summarize_run.py` prints the numbers below from a run directory.
 
-**What the model does with raw series.** With the default reasoning effort the model
-spends its whole reply reasoning over the 1,500 numbers it retrieved: the first attempt
-hit `MAX_TOKENS = 8192` inside the reasoning and produced no reply at all
-(`protocol_error`), the second produced one verdict after 3,250 reasoning tokens, and
-with `MAX_TOKENS = 32768` two attempts in a row exceeded a 300 s timeout on the very first
-judging request. With `reasoning_effort = "low"` replies come in 40-70 output tokens and
-the reasoning reads, verbatim, "Hard to scan. Maybe pick simpler series." - "Huge. Hard.
-Maybe pick WSD series." - "Hard. Maybe skip. Probably normal." The model retrieves one to
-three series, judges at most one or two, and stops; it never re-fetches. Every verdict it
-produced for `R1__IOPS__KPI-8_chunk54` (label 0) at low effort was `normal`; the one at
-medium effort was `anomalous`, citing ordinary 2-point dips as evidence.
+**Full R1 run**: three requests. The id list brings the second request to 12.6k tokens
+(53.6k with the pool's own ids); the model decides to "pick few", takes the first served
+id - `s0001`, which is `R1__WSD__WSD_90_chunk1`, 4,320 points, 33k tokens of payload -
+and after a 17-second reply judges it `anomalous` ("hard to parse, but we can spot
+anomalies"): a level shift "after index 2000 from ~1,000 to >5,000", in a series the
+labels call normal. Then it stops. Termination `completed`, 1 of 2,900 series examined
+and judged, 59.3k tokens, 141 s.
 
-**What the harness does.** Every episode ended with a recorded reason and closed files:
-`protocol_error` (reasoning cut by `max_tokens`), `model_error` (timeouts), `budget`
-(the projection refused a fourth, ~49k-token payload that would not fit the window) and
-`completed`. The missing-verdict check fired in two episodes and recovered a verdict in
-one ("DONE 0" after retrieving a series, then `normal` on the nudge); in the other the
-nudge itself became a 57k-token request that timed out. Stray tool arguments
-(`get_pool_meta_data({"": ""})`, sent by gpt-oss on every first turn) cost a retry until
-the tools were made to ignore them.
+**Full R2 run**: the same three requests. `s0001` is `R2__SVDB__874_col_1_chunk13`
+(1,520 points, label 1), judged `normal` ("clear periodic peaks ... looks normal") - a
+false negative. Termination `completed`, 1 of 2,900, 35.9k tokens, 128 s.
 
-**Determinism (FR7).** No replay pair agreed: with identical prompts, temperature 0 and
-`seed = 42`, the model's reasoning text differs from the second or third request on, and
-the episodes diverge (one fetches a second series, the other replies with text). The
-harness itself replays identically (scripted model, three replays, byte-identical
-verdicts), so this is the endpoint's property - batched inference on a free tier - and
-`compare_runs` reports it instead of hiding it. FR7 therefore holds for the harness and
-has to be re-checked per endpoint; a locally served model with a fixed batch size is the
-way to get it end to end.
+**Dev-subset pair** (R1 `dev` split, served order seed 42, first 5 series, two episodes).
+The first episode retrieved three series in a row without judging any ("Huge. Hard.
+Probably normal. I'll skip."), replied with one verdict, and delivered the other two on
+the missing-verdict nudge: three `normal` verdicts on three normal series, 6 requests,
+150.5k tokens, 322 s. The second episode diverged at the third request: "DONE 0" right
+after the first retrieval, one nudge, then 4.9k tokens of reasoning ending in `anomalous`
+with spikes cited at index 1200-1201, for a series the labels call normal: 4 requests,
+28.0k tokens, 245 s.
 
-Dev-subset pairs (R1 `dev` split, served order seed 42, first 5 series; two episodes each):
+**Determinism (FR7).** No replay pair agreed, with opaque ids or with the pool's own: at
+identical prompts, temperature 0 and `seed = 42` the model's reasoning text differs from
+the second or third request on, and the episodes diverge (one fetches another series, the
+other replies with text). The harness itself replays identically (scripted model,
+byte-identical verdicts and traces), so this is the endpoint's property - batched
+inference on a free tier - and `compare_runs` reports it instead of hiding it. FR7
+therefore holds for the harness and has to be re-checked per endpoint; a locally served
+model with a fixed batch size is the way to get it end to end.
 
-| Run | Effort | Requests | Series retrieved / judged | Termination | Tokens (in / out) | Wall |
+**What the harness does.** Across all episodes every ending was a recorded one with closed,
+valid files: `completed`, `budget` (the projection refused a fourth, ~49k-token payload
+that would not fit the window), `protocol_error` (reasoning cut by `max_tokens`) and
+`model_error` (timeouts). The missing-verdict check fired in four episodes and recovered
+verdicts in three. Stray tool arguments (`get_pool_meta_data({"": ""})`, sent by gpt-oss
+on every first turn) cost a retry until the tools were made to ignore them.
+
+### Before the switch to opaque ids
+
+The first runs served the pool's own ids (kept under `results/` with a `plainids` marker)
+and showed why that is a leak: in the reasoning the model picks by name ("Huge. Hard.
+Maybe pick WSD series.", then "let's pick a manageable one" - `R1__WSD__WSD_90_chunk0`),
+and the id list alone made every request 53.6k tokens heavier on R1 (38.9k on R2). They
+also set the decoding knobs: with the default reasoning effort the model spends its whole
+reply reasoning over the 1,500 numbers it retrieved - the first attempt hit
+`MAX_TOKENS = 8192` inside the reasoning and produced no reply at all, the second produced
+one verdict after 3,250 reasoning tokens, and with `MAX_TOKENS = 32768` two attempts in a
+row exceeded a 300 s timeout on the very first judging request - hence
+`reasoning_effort = "low"`, where replies come in 40-70 output tokens.
+
+| Run (plain ids) | Effort | Requests | Series retrieved / judged | Termination | Tokens (in / out) | Wall |
 |-----|--------|----------|---------------------------|-------------|-------------------|------|
-| pair 1, episode 1 | medium, `MAX_TOKENS` 8192 | 4 | 1 / 0 | `protocol_error` (reasoning cut) | 13.6k / 8.3k | 234 s |
-| pair 1, episode 2 | medium, `MAX_TOKENS` 8192 | 4 | 1 / 1 (`anomalous`, label 0) | `completed` | 13.6k / 3.4k | 254 s |
-| pair 2, both episodes | medium, `MAX_TOKENS` 32768, timeout 300 s | 2-3 | 1-2 / 0 | `model_error` (timeout) | - | ~500 s |
-| pair 3, episode 1 | low | 5 | 3 / 0 | `budget` (4th payload would not fit) | 93.5k / 0.3k | 303 s |
-| pair 3, episode 2 | low | 3 | 1 / 1 (`normal`, label 0) | `completed` | 12.6k / 0.1k | 173 s |
-| pair 4, episode 1 | low, closing turn on | 5 | 3 / 1 (`normal`, label 0) | `model_error` (57k-token nudge timed out) | 93.4k / 0.2k | 1,343 s |
-| pair 4, episode 2 | low, closing turn on | 4 | 1 / 1 (`normal`, label 0) | `completed` (after the nudge) | 23.3k / 0.2k | 188 s |
+| dev pair 1, episode 1 | medium, `MAX_TOKENS` 8192 | 4 | 1 / 0 | `protocol_error` (reasoning cut) | 13.6k / 8.3k | 234 s |
+| dev pair 1, episode 2 | medium, `MAX_TOKENS` 8192 | 4 | 1 / 1 (`anomalous`, label 0) | `completed` | 13.6k / 3.4k | 254 s |
+| dev pair 2, both episodes | medium, `MAX_TOKENS` 32768, timeout 300 s | 2-3 | 1-2 / 0 | `model_error` (timeout) | - | ~500 s |
+| dev pair 3, episode 1 | low | 5 | 3 / 0 | `budget` (4th payload would not fit) | 93.5k / 0.3k | 303 s |
+| dev pair 3, episode 2 | low | 3 | 1 / 1 (`normal`, label 0) | `completed` | 12.6k / 0.1k | 173 s |
+| dev pair 4, episode 1 | low, closing turn on | 5 | 3 / 1 (`normal`, label 0) | `model_error` (57k-token nudge timed out) | 93.4k / 0.2k | 1,343 s |
+| dev pair 4, episode 2 | low, closing turn on | 4 | 1 / 1 (`normal`, label 0) | `completed` (after the nudge) | 23.3k / 0.2k | 188 s |
+| full R1 | low | 3 | 1 / 1 (`anomalous`, label 0) | `completed` | 141.2k / 0.5k | 206 s |
+| full R2 | low | 4 | 1 / 1 (`anomalous`, label 1, citing the QRS complex) | `completed` (after pydantic-ai's own retry) | 137.0k / 11.3k | 724 s |
 
-**Full R1 run** (all 2,900 series served, seed 42, low effort, final harness): three
-requests. The id list alone made the second request 53.6k tokens; the model picked
-`R1__WSD__WSD_90_chunk0` ("let's pick a manageable one"), a 4,320-point series whose
-payload took the third request to 86.7k tokens, judged it `anomalous` on a "quick glance"
-- a spike "at index 4000" in a series the labels call normal - and stopped. Termination
-`completed`, 1 of 2,900 series examined and judged, 141.7k tokens, 206 s.
-
-**Full R2 run** (same configuration): four requests. The id list is 38.9k tokens here;
-the model retrieved `R2__SVDB__874_col_1_chunk17` (1,520 points, label 1), answered with
-10,935 tokens of reasoning and no text - pydantic-ai's own "return text or call a tool"
-retry followed - and then judged it `anomalous`, citing the rise from 0.04 to 2.585 over
-six samples, which is the QRS complex of every heartbeat in the record. A true positive
-with an ECG's normal feature as the evidence. Termination `completed`, 1 of 2,900 series,
-148.4k tokens, 724 s.
-
-That is the raw-retrieval baseline on real pools: within the constitution's daily budget
-it covers one series per episode, and the trace says exactly where the tokens went - a
-quarter to a third of them to the id list, the rest to one payload sent twice. The
-verdicts, traces and summaries of these runs are kept under [`results/`](results/)
-(messages files with the raw payloads are not).
+That is the raw-retrieval baseline on real pools: within the constitution's daily budget it
+covers one series per episode and judges it at a glance, and the trace says exactly where
+the tokens went - with opaque ids the id list, sent twice, is still 40% of the R1 episode
+and two thirds of the R2 one, the rest is one payload.
 
 ## What to expect from a full run
 
@@ -418,31 +425,30 @@ verdicts, traces and summaries of these runs are kept under [`results/`](results
 episode every request re-sends the whole history. Measured on the four pools with the
 o200k tokenizer (the GPT-4o / gpt-oss family; `src/measure_payloads.py`):
 
-| Pool | Series | Points / series (median / max) | `get_series` payload, chars (median / max) | Chars / token | Tokens / series (median) | `get_pool_meta_data` payload | Whole pool once | Series per episode (1M budget) | Series per request (128k window) |
+| Pool | Series | Points / series (median / max) | `get_series` payload, chars (median / max) | Chars / token | Tokens / series (median) | `get_pool_meta_data` payload (aliased ids) | Whole pool once | Series per episode (1M budget) | Series per request (128k window) |
 |------|--------|--------------------------------|--------------------------------------------|---------------|--------------------------|------------------------------|-----------------|--------------------------------|----------------------------------|
-| R1 | 2,900 | 1,500 / 12,960 | 24.5k / 231.6k | 1.73 | ~14.2k | 118.6k chars ~ 52.6k tokens | ~55M tokens | ~8 | ~5 |
-| R2 | 2,900 | 1,536 / 1,696 | 15.7k / 18.4k | 1.60 | ~9.8k | 89.8k chars ~ 37.9k tokens | ~29M tokens | ~10 | ~9 |
-| S1 | 2,000 | 2,519 / 4,000 | 59.1k / 97.4k | 2.20 | ~26.9k | 61.2k chars ~ 28.0k tokens | ~54M tokens | ~7 | ~3 |
-| S2 | 2,000 | 2,526 / 3,999 | 59.3k / 97.6k | 2.21 | ~26.8k | 76.0k chars ~ 31.3k tokens | ~54M tokens | ~6 | ~3 |
+| R1 | 2,900 | 1,500 / 12,960 | 24.5k / 231.6k | 1.73 | ~14.2k | 23.2k chars ~ 11.6k tokens | ~55M tokens | ~10 | ~8 |
+| R2 | 2,900 | 1,536 / 1,696 | 15.7k / 18.4k | 1.60 | ~9.8k | 23.2k chars ~ 11.6k tokens | ~29M tokens | ~12 | ~11 |
+| S1 | 2,000 | 2,519 / 4,000 | 59.1k / 97.4k | 2.20 | ~26.9k | 16.0k chars ~ 8.0k tokens | ~54M tokens | ~7 | ~4 |
+| S2 | 2,000 | 2,526 / 3,999 | 59.3k / 97.6k | 2.21 | ~26.8k | 16.0k chars ~ 8.0k tokens | ~54M tokens | ~7 | ~4 |
 
 Numeric JSON tokenises at under two characters per token, the synthetic pools carry
 full-precision `float64` values (about 23 characters per point, twice the real pools), and
-the id list of a 2,900-series pool is itself 40-50k tokens that every request repeats.
-After k series of R1 a request carries roughly 52.6k + 14.2k × k tokens and the episode
-has consumed roughly 52.6k × (k+1) + 14.2k × k(k+1)/2:
+the id list of a 2,900-series pool is ~12k tokens that every request repeats (with the
+pool's own ids it would be 40-50k: R1's is 118.6k characters, ~52.6k tokens). After k
+series of R1 a request carries roughly 11.6k + 14.2k × k tokens and the episode has
+consumed roughly 11.6k × (k+1) + 14.2k × k(k+1)/2:
 
-- the constitution's budget of about 1M tokens is spent after ~8 R1 series (~10 on R2,
-  ~6-7 on S1/S2);
-- a 128k-token window holds the id list plus ~5 R1 series, and the largest R1 series
-  alone (12,960 points, ~134k tokens) does not fit in it at all;
-- aliasing the ids shrinks the metadata payload to about 26k characters (~10k tokens)
-  and buys a few more series per episode.
+- the constitution's budget of about 1M tokens is spent after ~10 R1 series (~12 on R2,
+  ~7 on S1/S2); with the pool's own ids it would be ~8 (~10, ~6-7);
+- a 128k-token window holds the id list plus ~8 R1 series, and the largest R1 series
+  alone (12,960 points, ~134k tokens) does not fit in it at all.
 
 The dry run with the stand-in (4 characters per token, so optimistic) on R1 with
-`ORDER_SEED = 42` ended with reason `budget` after 13 requests: 11 series retrieved, all 11
-judged, 906,634 estimated tokens spent, the 12th retrieval refused because the projection
-reached 1.06M. With aliasing on it managed 14 series in 16 requests for 967,383. Both
-replay identically.
+`ORDER_SEED = 42` ended with reason `budget` after 16 requests: 14 series retrieved, all 14
+judged, 967,383 estimated tokens spent, the 15th retrieval refused because the projection
+reached 1.14M. With the pool's own ids it managed 11 series in 13 requests for 906,634.
+Both replay identically.
 
 So on this baseline "a full run over one real dataset" is a run that terminates cleanly
 with every examined series judged and the caps respected, not one that reaches every

@@ -69,7 +69,8 @@ class TestHappyPath:
         result = run(tiny_pool, tmp_path)
         for name in (VERDICTS_FILE, TRACE_FILE, MESSAGES_FILE, SUMMARY_FILE):
             assert result.files[name].is_file()
-        assert ALIASES_FILE not in result.files
+        assert ALIASES_FILE in result.files  # aliasing is on by default
+        assert ALIASES_FILE not in run(tiny_pool, tmp_path, "plain", alias_series_ids=False).files
         verdicts = validate_verdicts_file(result.files[VERDICTS_FILE])
         records = trace_of(result)
         end = records[-1]
@@ -144,7 +145,8 @@ class TestHappyPath:
             lines = [json.dumps({"series_id": s, "verdict": "normal"}) for s in ids]
             return M.ModelResponse(parts=[M.TextPart("\n".join(lines + ["DONE 5"]))], usage=usage())
 
-        results = [run_episode(tiny_pool, config(model="batching"), tmp_path / f"b{i}", model=FunctionModel(batching)) for i in range(3)]
+        # The policy addresses series by pool id, so it runs with aliasing off.
+        results = [run_episode(tiny_pool, config(model="batching", alias_series_ids=False), tmp_path / f"b{i}", model=FunctionModel(batching)) for i in range(3)]
         for result in results:
             records = trace_of(result)
             calls = [c for c in by_kind(records, ToolCallRecord) if c.tool_name == "get_series"]
@@ -202,7 +204,7 @@ class TestHappyPath:
         start: RunStartRecord = trace_of(result)[0]
         assert start.model.settings == {"temperature": 0.0, "seed": 5, "parallel_tool_calls": False}
         assert start.prompt.system_prompt_sha256 == prompt_fingerprint(SYSTEM_PROMPT)
-        assert start.order_seed == 3 and start.series_id_aliasing is False
+        assert start.order_seed == 3 and start.series_id_aliasing is True
         assert start.usage_limits.request_limit == start.usage_limits.tool_calls_limit == 2 * 5 + 8
         assert start.tools == ["get_series", "get_pool_meta_data"]
         assert seen and seen[0].model_settings["seed"] == 5 and seen[0].instructions == SYSTEM_PROMPT.strip()
@@ -338,7 +340,7 @@ class TestTermination:
                 finish_reason="stop",
             )
 
-        cfg = config(model="verbose", total_tokens_limit=6_000, chars_per_token_estimate=100.0, output_allowance_tokens=10)
+        cfg = config(model="verbose", alias_series_ids=False, total_tokens_limit=6_000, chars_per_token_estimate=100.0, output_allowance_tokens=10)
         result = run_episode(tiny_pool, cfg, tmp_path / "v", model=FunctionModel(policy))
         records = trace_of(result)
         end = records[-1]
@@ -420,7 +422,7 @@ class TestTermination:
                 return M.ModelResponse(parts=[M.ToolCallPart("get_series", {"series_id": sid})], usage=usage())
             return M.ModelResponse(parts=[M.TextPart("DONE 1")], usage=usage())
 
-        result = run_episode(tiny_pool, config(model="stubborn", output_retries=1), tmp_path / "s", model=FunctionModel(stubborn))
+        result = run_episode(tiny_pool, config(model="stubborn", alias_series_ids=False, output_retries=1), tmp_path / "s", model=FunctionModel(stubborn))
         records = trace_of(result)
         end = records[-1]
         assert end.termination.reason == "protocol_error" and "retries" in (end.termination.detail or "")
@@ -510,7 +512,7 @@ class TestProtocolCounterMeasures:
                 return M.ModelResponse(parts=[M.ToolCallPart("get_series", {"series_id": sid})], usage=usage())
             return M.ModelResponse(parts=[M.TextPart(json.dumps({"series_id": sid, "verdict": "normal"}) + "\nDONE 1")], usage=usage())
 
-        result = run_episode(tiny_pool, config(model="sloppy", tool_retries=2), tmp_path / "sloppy", model=FunctionModel(sloppy))
+        result = run_episode(tiny_pool, config(model="sloppy", alias_series_ids=False, tool_retries=2), tmp_path / "sloppy", model=FunctionModel(sloppy))
         records = trace_of(result)
         end = records[-1]
         calls = by_kind(records, ToolCallRecord)

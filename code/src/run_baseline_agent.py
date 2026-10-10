@@ -12,7 +12,7 @@ One run writes, under ``OUTPUT_DIR / RUN_NAME``:
     decision_trace.jsonl     tool calls, model requests, per-series roll-ups, totals (FR6)
     messages.json            the conversation as pydantic-ai kept it
     summary.json             the run_end record plus run identifiers
-    series_aliases.json      alias -> pool id, only when ALIAS_SERIES_IDS is on
+    series_aliases.json      alias -> pool id (ALIAS_SERIES_IDS, on by default)
 
 Both output files are validated after the run; a broken invariant fails the script. With
 ``REPLAYS > 1`` the same episode is run again into sibling directories and every replay is
@@ -64,8 +64,10 @@ ORDER_SEED = 42                   # seeded permutation of the order the agent is
                                   # (spec-01 files are grouped by source, so file order
                                   # walks one recording at a time); None = file order
 SERIES_LIMIT = None               # keep only the first N series of the served order; None = all
-ALIAS_SERIES_IDS = False          # True: the agent sees opaque ids (s0001, ...) instead of
-                                  # the provenance-carrying spec-01 ids; outputs keep real ids
+ALIAS_SERIES_IDS = True           # the agent sees opaque ids (s0001, ...) instead of the
+                                  # spec-01 ids, whose source names predict the label on R1;
+                                  # outputs keep the pool's ids. False = serve the ids as is
+                                  # (the run name gets a "plainids" marker)
 
 # --- Model ---
 # The constitution caps the LLM at ~20B parameters, so the intended targets are local or
@@ -199,6 +201,8 @@ def run_name(pool: Pool) -> str:
         parts.append(SPLIT)
     if SERIES_LIMIT is not None:
         parts.append(f"first{SERIES_LIMIT}")
+    if not ALIAS_SERIES_IDS:
+        parts.append("plainids")
     return "_".join(parts) + "__" + model_slug(MODEL)
 
 

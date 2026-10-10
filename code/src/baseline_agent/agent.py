@@ -2,7 +2,7 @@
 
 What the harness adds on top of the two pure tool functions in ``tools.py`` is
 bookkeeping only: timing and a trace record around every call (FR6), the record of which
-series were examined, the optional id aliasing of ``ids.py``, and an output validator that
+series were examined, the id aliasing of ``ids.py``, and an output validator that
 refuses to end the episode while a retrieved series still has no verdict (FR4/FR5: "a
 verdict for each series it examines"). The validator never asks for more coverage of the
 pool - stopping early is the agent's own decision and is left alone.

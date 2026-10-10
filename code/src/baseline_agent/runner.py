@@ -108,7 +108,7 @@ class EpisodeConfig:
     parallel_tool_calls: bool | None = False
     extra_model_settings: dict[str, Any] = field(default_factory=dict)
     order_seed: int | None = None  # None: serve the pool in file order
-    alias_series_ids: bool = False
+    alias_series_ids: bool = True  # opaque ids for the model; see ids.py
     request_limit: int | None = None  # None: 2 requests per series + 8
     tool_calls_limit: int | None = None  # None: 2 calls per series + 8
     total_tokens_limit: int | None = 1_000_000

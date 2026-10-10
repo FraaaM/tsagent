@@ -3,11 +3,11 @@
 Spec-01 ids carry their provenance - ``R1__YAHOO__real_42_full`` - and on R1 that
 provenance predicts the label: YAHOO samples are 95% anomalous, NEK 100%, unsplit
 ``_full`` samples 96% against 23% for chunks. A raw-retrieval agent could therefore guess
-from the id without reading a value. With aliasing on, both tools speak opaque names
+from the id without reading a value. So by default both tools speak opaque names
 (``s0001`` ... in served order) and the agent writes verdicts against them; every output
 file and every trace field still carries the pool's ids, and the mapping is written next
-to them. Aliasing is off by default: spec 02 defines the tools in terms of the pool's ids,
-so hiding them is an experimental choice to make explicitly (see the task README).
+to them. ``PlainIds`` serves the pool's ids as they are, for experiments on the leak
+itself; the flag is recorded in ``run_start`` either way (see the task README).
 
 Both views resolve what the model wrote back to a pool id, tolerating surrounding
 whitespace, and return ``None`` for anything else.
