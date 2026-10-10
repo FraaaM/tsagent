@@ -34,16 +34,16 @@ how to run it and what to expect from it.
 - [x] Unit tests, no LLM and no GPU (spec §3, unit level): tool registration and the
       settings the model receives, tool behaviour, strict output schemas, and whole episodes
       driven by a scripted stand-in model through every termination path -
-      [`code/tests/`](../../code/tests/), 100 tests.
+      [`code/tests/`](../../code/tests/), 101 tests.
 - [x] Dry runs on the real R1 pool with the stand-in: pipeline, trace consistency and
       replay identity hold on real data; [`src/measure_payloads.py`](src/measure_payloads.py)
       reproduces the context arithmetic below.
-- [x] End-to-end runs with an LLM (spec §3, E2E level) on a free endpoint, gpt-oss-20b
-      through OVHcloud's anonymous tier: replay pairs and full R1 and R2 runs, with opaque
-      ids and, before the switch, with the pool's own - see
-      [End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints). The
-      harness behaves as designed; the endpoint does not replay deterministically, and the
-      model examines one to three series per episode.
+- [x] End-to-end runs with an LLM (spec §3, E2E level) on two free endpoints, gpt-oss-20b
+      through OVHcloud's anonymous tier and GLM-4.7-Flash through Z.AI's free tier: replay
+      pairs and full R1 and R2 runs, with opaque ids and, before the switch, with the
+      pool's own - see [End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints).
+      The harness behaves as designed; neither endpoint replays deterministically; gpt-oss
+      examines one to three series per episode, GLM fills the window with three to ten.
 - [ ] The same checks on a locally served model with a fixed batch size, where the FR7
       replay can be verified end to end, and enough episodes per pool to characterise
       coverage beyond a single run.
@@ -140,9 +140,9 @@ MODEL = "openrouter:openai/gpt-oss-20b"    # OPENROUTER_API_KEY
 MODEL = "anthropic:claude-sonnet-4-5"      # ANTHROPIC_API_KEY - harness checks only, out of the 20B constraint
 ```
 
-Free tiers work through the same `MODEL_BASE_URL` path. The keyless OVHcloud tier served
-the runs in [End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints);
-Z.AI's free GLM flash models are wired the same way and need a key:
+Free tiers work through the same `MODEL_BASE_URL` path. Both of these served the runs in
+[End-to-end runs on free endpoints](#end-to-end-runs-on-free-endpoints); the second needs
+a key:
 
 ```python
 # OVHcloud AI Endpoints, anonymous: no key, 2 requests per minute per IP, and a rejected
@@ -154,10 +154,17 @@ MODEL_ANONYMOUS = True
 REQUEST_INTERVAL_S = 35.0
 
 # Z.AI (Zhipu), free GLM flash models: a key from the platform's console, kept in a file
-# outside the repository (or in an environment variable named by MODEL_API_KEY_ENV)
+# outside the repository (or in an environment variable named by MODEL_API_KEY_ENV).
+# One request at a time: back-to-back requests get 429 without a retry-after, so the
+# harness waits RATE_LIMIT_WAIT_S; a prompt beyond ~128k tokens is refused with HTTP 400
+# "Prompt exceeds max length", hence the window below. PARALLEL_TOOL_CALLS = False is
+# honoured (without it GLM batches 5-10 retrievals per turn)
 MODEL = "openai-chat:glm-4.7-flash"
 MODEL_BASE_URL = "https://api.z.ai/api/paas/v4"
 MODEL_API_KEY_FILE = _REPO.parent / "zai_api_key.txt"
+REQUEST_INTERVAL_S = 10.0
+MAX_TOKENS = 8192
+CONTEXT_TOKENS_LIMIT = 131_072
 ```
 
 Provider-specific settings go into `EXTRA_MODEL_SETTINGS` (for example
@@ -263,7 +270,12 @@ the runner projects the next request from the provider's own count of the curren
 the size of the requested payloads and a reply allowance, and ends the episode with reason
 `budget` *before* fetching when the projection breaks `TOTAL_TOKENS_LIMIT` or
 `CONTEXT_TOKENS_LIMIT`. The requested-but-unfetched ids are named in the termination
-detail. If the model still owes verdicts for series it did retrieve at that point (some
+detail. When one turn asks for several series, they are admitted in issue order while the
+projection still fits and the rest of the turn is answered with a textual `not retrieved`
+error naming the series, so a model that batches retrievals (GLM-4.7-Flash does, whatever
+`parallel_tool_calls` says) gets what fits instead of ending the episode on its first
+over-sized turn; only a turn whose first retrieval does not fit is a budget stop. If the
+model still owes verdicts for series it did retrieve at that point (some
 models fetch several series before judging any), it gets one closing turn: the pending
 call is answered with a not-executed error and the model is asked for those verdicts -
 the same examined-implies-judged rule the output validator applies when the model stops by
@@ -389,6 +401,54 @@ that would not fit the window), `protocol_error` (reasoning cut by `max_tokens`)
 verdicts in three. Stray tool arguments (`get_pool_meta_data({"": ""})`, sent by gpt-oss
 on every first turn) cost a retry until the tools were made to ignore them.
 
+### A second endpoint: GLM-4.7-Flash on Z.AI's free tier
+
+The same episodes were run on `glm-4.7-flash` through Z.AI's free tier (a key from the
+platform's console; one request at a time, 429 without `retry-after` on back-to-back
+requests; thinking left at the model's default; `MAX_TOKENS = 8192`,
+`CONTEXT_TOKENS_LIMIT = 131072` after a probe had a ~150k-token prompt refused with
+HTTP 400 "Prompt exceeds max length" while 119k went through; `REQUEST_INTERVAL_S = 10`;
+`PARALLEL_TOOL_CALLS = False`). The tier is accepted but unreliable: requests sat in its
+queue for one to four minutes, two episodes ended in a 429 "service temporarily
+overloaded" or a 500 "network error" that outlasted the harness's eight retries, one
+1k-token request hit the 900 s timeout, and one full-R1 attempt never got a first
+response in fourteen minutes of retries.
+
+**What the model does with raw series.** The opposite of gpt-oss: GLM walks the served
+list in order, reasons for 150-5,000 tokens over each payload ("Let me analyze s0001. The
+values range from around 21 to 28 ..."), writes the verdict and the next retrieval in one
+reply, as the protocol asks, and keeps going until the window is full. It also ignores
+`parallel_tool_calls`: on the full pools it asks for five series per turn ("given the
+large number of series, I need to be efficient"), which is where the prefix rule of the
+budget projection matters - a probe run made before that rule ended with zero series
+examined, because its first five-series turn (~121k tokens of payload) did not fit as a
+whole.
+
+**Dev-subset pair** (same five series, two episodes): both retrieved four series one at a
+time and judged three before the tier failed the sixth request (429 overloaded in one,
+500 in the other). The verdicts flipped between the episodes - `normal` / `anomalous` /
+`anomalous` in the first, `anomalous` / `normal` / `normal` in the second, on the same
+three normal series, the explanations citing "sustained level shifts" either way: 111k
+and 115k tokens, 1,008 s and 1,432 s.
+
+**Full R2 run**: four requests, five retrievals per turn. Ten series judged - one
+`anomalous`, a true positive (`R2__MITDB__215_col_0_chunk154`); four positives and five
+negatives called `normal` - then the projection refused the third batch (52k tokens of
+payload on top of a 123k-token context) and the episode ended with reason `budget`, every
+retrieved series judged. The fourth reply carried 38k tokens of reasoning over five ECG
+chunks: `MAX_TOKENS` caps the visible reply, not the thinking. 246.7k tokens, 634 s.
+
+**Full R1 run**: three requests. The model asks for five series at once; the projection
+admits the first four (105k tokens of payload on top of a 14k-token context) and refuses
+the fifth, the model reads the refusal ("I see that s0005 would not fit in the budget"),
+judges the four it got - `normal` on four normal series - and asks for four more, which
+the projection refuses as a whole (170k tokens against a 131k window): reason `budget`,
+4 of 2,900 series examined and judged, 134.8k tokens, 118 s.
+
+**Determinism (FR7)**: no pair agreed here either; the two dev-subset episodes differ
+from the very first response (the reasoning text is not the same), and their verdicts
+disagree on every series.
+
 ### Before the switch to opaque ids
 
 The first runs served the pool's own ids (kept under `results/` with a `plainids` marker)
@@ -415,9 +475,11 @@ row exceeded a 300 s timeout on the very first judging request - hence
 | full R2 | low | 4 | 1 / 1 (`anomalous`, label 1, citing the QRS complex) | `completed` (after pydantic-ai's own retry) | 137.0k / 11.3k | 724 s |
 
 That is the raw-retrieval baseline on real pools: within the constitution's daily budget it
-covers one series per episode and judges it at a glance, and the trace says exactly where
-the tokens went - with opaque ids the id list, sent twice, is still 40% of the R1 episode
-and two thirds of the R2 one, the rest is one payload.
+covers one series per episode with gpt-oss-20b, which judges at a glance, and three to ten
+with GLM-4.7-Flash, which reasons over every payload until the window is full; its
+verdicts on the same series flip between episodes, and the trace says exactly where the
+tokens went - with opaque ids the id list, sent with every request, is still 40% of the
+gpt-oss R1 episode and two thirds of its R2 one, the rest is one payload.
 
 ## What to expect from a full run
 
